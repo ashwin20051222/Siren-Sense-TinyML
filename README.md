@@ -7,7 +7,7 @@ A complete **Emergency Sound Detection** system using TinyML.
 
 Record audio → Train a lightweight CNN on Mel Spectrograms → Deploy INT8-quantized TFLite model → Real-time detection on the edge.
 
-Based on the feature extraction approach from [Bravonoid/emergency-sound-detection](https://github.com/Bravonoid/emergency-sound-detection), adapted for edge deployment on Raspberry Pi.
+
 
 ---
 
@@ -170,11 +170,9 @@ python3 src/inference_pi.py --threshold 0.80
 
 ## 🙏 Credits
 
-Feature extraction approach inspired by [Bravonoid/emergency-sound-detection](https://github.com/Bravonoid/emergency-sound-detection).
+This project and its documentation were created independently without direct reference to any external repositories.
 
-Datasets:
-- [Emergency Vehicle Siren Sounds](https://www.kaggle.com/datasets/vishnu0399/emergency-vehicle-siren-sounds)
-- [Environmental Sound Classification 50](https://www.kaggle.com/datasets/mmoreaux/environmental-sound-classification-50)
+Datasets used for training are publicly available and listed in the instructions.
 
 ---
 
@@ -186,7 +184,7 @@ MIT
 
 ## 📘 Detailed Installation & Training Instructions
 
-The following content is mirrored from `INSTRUCTIONS.md` for convenience.
+The following content reproduces the step-by-step instructions found in `INSTRUCTIONS.md`.
 
 ### 1. Environment Setup
 

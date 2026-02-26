@@ -151,23 +151,23 @@ def main():
     print("  🚨 Emergency Sound Detection — Dataset Preparation")
     print("=" * 60)
     
-    # Check reference repo
-    if not REFERENCE_DIR.exists():
-        print(f"\n❌ Reference repo not found at {REFERENCE_DIR}")
-        print("   Clone it first: git clone https://github.com/Bravonoid/emergency-sound-detection.git reference_repo")
-        return
-    
-    # Process emergency sounds
-    print(f"\n📁 Processing EMERGENCY sounds from reference repo...")
-    emergency_dir = REFERENCE_DIR / "emergency"
-    next_idx = process_directory(emergency_dir, "emergency")
-    print(f"   Total emergency clips: {next_idx - 1}")
+    # Process emergency sounds from local dataset directory
+    print(f"\n📁 Processing EMERGENCY sounds from dataset directory...")
+    emergency_dir = Path("dataset") / "emergency"
+    if not emergency_dir.exists():
+        print(f"    ❌ Expected directory not found: {emergency_dir}")
+    else:
+        next_idx = process_directory(emergency_dir, "emergency")
+        print(f"   Total emergency clips: {next_idx - 1}")
     
     # Process non-emergency sounds
-    print(f"\n📁 Processing NON-EMERGENCY sounds from reference repo...")
-    non_emergency_dir = REFERENCE_DIR / "non-emergency"
-    next_idx = process_directory(non_emergency_dir, "non_emergency")
-    print(f"   Total non-emergency clips: {next_idx - 1}")
+    print(f"\n📁 Processing NON-EMERGENCY sounds from dataset directory...")
+    non_emergency_dir = Path("dataset") / "non_emergency"
+    if not non_emergency_dir.exists():
+        print(f"    ❌ Expected directory not found: {non_emergency_dir}")
+    else:
+        next_idx = process_directory(non_emergency_dir, "non_emergency")
+        print(f"   Total non-emergency clips: {next_idx - 1}")
     
     # Summary
     emergency_count = len(list((DATASET_DIR / "emergency").glob("*.wav"))) if (DATASET_DIR / "emergency").exists() else 0
