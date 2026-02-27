@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+models/
+dataset/
+*.h5
+*.tflite
+*.png
+*.mp4
+*.wav
+*.csv
