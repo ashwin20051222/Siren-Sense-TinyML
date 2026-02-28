@@ -394,8 +394,8 @@ def build_model(num_classes: int, input_shape: Optional[Tuple[int, ...]] = None)
     """
     Build a deeper CNN for emergency sound detection.
 
-    5 DepthwiseSeparable Conv blocks on Mel Spectrograms.
-    Target: < 600k trainable parameters for edge deployment.
+    7 DepthwiseSeparable Conv blocks on Mel Spectrograms.
+    Target: < 1.5M trainable parameters for enhanced accuracy.
 
     Args:
         num_classes:  Number of output classes (typically 2: emergency / non_emergency).
@@ -477,10 +477,38 @@ def build_model(num_classes: int, input_shape: Optional[Tuple[int, ...]] = None)
         layers.Conv2D(512, (1, 1), padding="same", kernel_initializer="he_normal"),
         layers.BatchNormalization(),
         layers.ReLU(),
+        layers.MaxPooling2D(pool_size=(2, 2)),
+        layers.Dropout(0.35),
+
+        # Block 6: Depthwise Separable Conv — 512 filters (NEW)
+        layers.DepthwiseConv2D(
+            kernel_size=(3, 3), padding="same", activation=None,
+            depthwise_initializer="he_normal",
+        ),
+        layers.BatchNormalization(),
+        layers.ReLU(),
+        layers.Conv2D(512, (1, 1), padding="same", kernel_initializer="he_normal"),
+        layers.BatchNormalization(),
+        layers.ReLU(),
+        layers.MaxPooling2D(pool_size=(2, 2)),
+        layers.Dropout(0.35),
+
+        # Block 7: Depthwise Separable Conv — 512 filters (NEW)
+        layers.DepthwiseConv2D(
+            kernel_size=(3, 3), padding="same", activation=None,
+            depthwise_initializer="he_normal",
+        ),
+        layers.BatchNormalization(),
+        layers.ReLU(),
+        layers.Conv2D(512, (1, 1), padding="same", kernel_initializer="he_normal"),
+        layers.BatchNormalization(),
+        layers.ReLU(),
         layers.GlobalAveragePooling2D(),
         layers.Dropout(0.4),
 
-        # Classifier head
+        # Classifier head (wider)
+        layers.Dense(512, activation="relu", kernel_initializer="he_normal"),
+        layers.Dropout(0.5),
         layers.Dense(256, activation="relu", kernel_initializer="he_normal"),
         layers.Dropout(0.4),
         layers.Dense(128, activation="relu", kernel_initializer="he_normal"),
@@ -496,10 +524,10 @@ def build_model(num_classes: int, input_shape: Optional[Tuple[int, ...]] = None)
 
     total_params = model.count_params()
     logger.info("Total parameters: %d", total_params)
-    if total_params > 600_000:
-        logger.warning("⚠️  Model exceeds 600k parameter target!")
+    if total_params > 1_500_000:
+        logger.warning("⚠️  Model exceeds 1.5M parameter target!")
     else:
-        logger.info("✅  Model is within 600k parameter budget.")
+        logger.info("✅  Model is within 1.5M parameter budget.")
 
     model.summary(print_fn=logger.info)
     return model
@@ -673,10 +701,10 @@ def export_tflite(
 
     size_kb = output_path.stat().st_size / 1024
     logger.info("✅  TFLite model saved: %s (%.1f KB)", output_path, size_kb)
-    if size_kb > 200:
-        logger.warning("⚠️  Model exceeds 200 KB target.")
+    if size_kb > 500:
+        logger.warning("⚠️  Model exceeds 500 KB target.")
     else:
-        logger.info("✅  Model is within 200 KB budget.")
+        logger.info("✅  Model is within 500 KB budget.")
 
 
 def save_class_names(class_names: List[str], output_path: Path) -> None:
