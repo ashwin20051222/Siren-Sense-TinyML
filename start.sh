@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================
 #  start.sh — One-Click Launcher for Siren Sense
-#  Activates venv, finds ESP32 automatically, starts ML
+#  Activates venv, finds ESP32-CAM automatically, starts ML
+#  Pipeline: Laptop ML → ESP32-CAM → Roboflow → ESP-NOW → STM32
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

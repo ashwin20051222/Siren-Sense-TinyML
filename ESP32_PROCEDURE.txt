@@ -1,4 +1,4 @@
-# Step-by-Step Procedure: Using Local AI with ESP32-CAM
+# Step-by-Step Procedure: Using Local AI with ESP32-CAM + ESP-NOW
 ## Siren Sense — Emergency Sound Detection + Ambulance Verification
 
 ---
@@ -8,10 +8,11 @@
 Your laptop microphone listens for ambulance sirens using a trained AI model.
 When a siren is detected, your laptop tells the ESP32-CAM (over WiFi) to take
 a photo. The ESP32 sends that photo to Roboflow to check if it's really an
-ambulance. If yes, the ESP32 sends a LoRa alert to the STM32 traffic controller.
+ambulance. If yes, the ESP32-CAM sends an ESP-NOW message to a second ESP32
+(receiver), which forwards it via UART wire to the STM32 traffic controller.
 
 ```
-Laptop Mic → AI Model → WiFi → ESP32-CAM → Camera → Roboflow → LoRa → STM32
+Laptop Mic → AI Model → WiFi → ESP32-CAM → Camera → Roboflow → ESP-NOW → Receiver ESP32 → UART → STM32
 ```
 
 ---
@@ -21,43 +22,54 @@ Laptop Mic → AI Model → WiFi → ESP32-CAM → Camera → Roboflow → LoRa 
 Hardware:
   - Laptop with microphone (built-in or USB)
   - ESP32-CAM (AI-Thinker) with OV2640 camera
-  - SX1278 LoRa module (433 MHz)
+  - ESP32 DevKit (any standard ESP32 board) — the receiver
   - Sound sensor module (analog, optional fallback)
-  - FTDI USB-UART adapter (for flashing ESP32)
-  - Jumper wires
+  - 16x2 I2C LCD with PCF8574 backpack (optional status display, up to 3)
+  - FTDI USB-UART adapter (for flashing ESP32-CAM)
+  - Jumper wires (3 wires for ESP32 receiver → STM32 connection)
 
 Software:
   - Python 3.10 / 3.11 / 3.12 on laptop
   - Arduino IDE (with ESP32 board package installed)
   - Roboflow account with trained ambulance detection model
 
-Both laptop and ESP32 must be on the SAME WiFi network.
+Both laptop and ESP32-CAM must be on the SAME WiFi network.
+Both ESP32 boards must be on the SAME WiFi network (for ESP-NOW channel).
 
 ---
 
 ## STEP 1: WIRE THE HARDWARE
 
-LoRa SX1278 → ESP32-CAM:
-  SX1278 VCC   → ESP32 3.3V
-  SX1278 GND   → ESP32 GND
-  SX1278 SCK   → ESP32 GPIO 14
-  SX1278 MISO  → ESP32 GPIO 12
-  SX1278 MOSI  → ESP32 GPIO 13
-  SX1278 NSS   → ESP32 GPIO 15
-  SX1278 RST   → ESP32 GPIO 2
-  SX1278 DIO0  → ESP32 GPIO 4
+Receiver ESP32 → STM32 (USART3 — only 3 wires!):
+  ESP32 GPIO 17 (TX2) → STM32 PB11 (USART3 RX)
+  ESP32 GPIO 16 (RX2) → STM32 PB10 (USART3 TX)   [optional]
+  ESP32 GND            → STM32 GND                 [MUST connect!]
 
 Sound Sensor → ESP32-CAM (optional fallback):
-  Sensor VCC   → ESP32 3.3V
-  Sensor GND   → ESP32 GND
-  Sensor OUT   → ESP32 GPIO 33
+  Sensor VCC   → ESP32-CAM 3.3V
+  Sensor GND   → ESP32-CAM GND
+  Sensor OUT   → ESP32-CAM GPIO 33
+
+LCD 16x2 I2C → ESP32-CAM (optional status display):
+  LCD SDA      → ESP32-CAM GPIO 26     (shared with camera, uses Wire1)
+  LCD SCL      → ESP32-CAM GPIO 27     (shared with camera, uses Wire1)
+  LCD VCC      → ESP32-CAM 5V
+  LCD GND      → ESP32-CAM GND
+  (Default I2C address: 0x27. Try 0x3F if display is blank.)
+  (Set LCD_ENABLED to 0 in the code if no LCD connected.)
+
+LCD 16x2 I2C → Receiver ESP32 (optional):
+  LCD SDA      → ESP32 GPIO 21
+  LCD SCL      → ESP32 GPIO 22
+  LCD VCC      → ESP32 5V
+  LCD GND      → ESP32 GND
 
 FTDI Programmer → ESP32-CAM (for flashing only):
-  FTDI 3.3V    → ESP32 3.3V
-  FTDI GND     → ESP32 GND
-  FTDI TX      → ESP32 GPIO 3 (RX0)
-  FTDI RX      → ESP32 GPIO 1 (TX0)
-  Jumper wire: ESP32 IO0 → GND  (ONLY during flashing)
+  FTDI 3.3V    → ESP32-CAM 3.3V
+  FTDI GND     → ESP32-CAM GND
+  FTDI TX      → ESP32-CAM GPIO 3 (RX0)
+  FTDI RX      → ESP32-CAM GPIO 1 (TX0)
+  Jumper wire: ESP32-CAM IO0 → GND  (ONLY during flashing)
 
 ---
 
@@ -72,53 +84,90 @@ FTDI Programmer → ESP32-CAM (for flashing only):
 
 ---
 
-## STEP 3: CONFIGURE THE ESP32 FIRMWARE
-
-Open the file:
-  esp32_firmware/ambulance_detector/ambulance_detector.ino
-
-Edit these lines near the top (around line 50-65):
-
-  #define WIFI_SSID           "YourWiFiName"        ← your WiFi name
-  #define WIFI_PASSWORD       "YourWiFiPassword"    ← your WiFi password
-  #define ROBOFLOW_API_URL    "https://detect.roboflow.com/YOUR_PROJECT/VERSION"
-  #define ROBOFLOW_API_KEY    "YOUR_API_KEY"
-  #define ROBOFLOW_TARGET_CLASS "ambulance"          ← class name from Roboflow
-  #define MONITORED_LANE_ID   0                      ← lane (0=N, 1=E, 2=S, 3=W)
-  #define TRIGGER_MODE        0                      ← 0 for WiFi
-
-Save the file.
-
----
-
-## STEP 4: INSTALL ARDUINO LIBRARIES
+## STEP 3: INSTALL ARDUINO LIBRARY
 
 Open Arduino IDE → Sketch → Include Library → Manage Libraries:
 
-  1. Search "LoRa" → install "LoRa by Sandeep Mistry" (v0.8.0+)
-  2. Search "ArduinoJson" → install "ArduinoJson by Benoit Blanchon" (v6 or v7)
-  3. ESP32 board package should already be installed
+  1. Search "ArduinoJson" → install "ArduinoJson by Benoit Blanchon" (v6 or v7)
+  2. ESP32 board package should already be installed
+
+Note: No LoRa library needed! ESP-NOW is built into the ESP32.
 
 ---
 
-## STEP 5: FLASH THE ESP32-CAM
+## STEP 4: FLASH THE RECEIVER ESP32 (DO THIS FIRST!)
 
-1. In Arduino IDE:
+Why first? You need the receiver's MAC address before you can configure
+the sender.
+
+1. Open the file:
+   esp32_firmware/stm32_esp32_receiver/stm32_esp32_receiver.ino
+
+2. Edit Section 1 — only WiFi credentials needed:
+   #define WIFI_SSID           "YourWiFiName"        ← your WiFi name
+   #define WIFI_PASSWORD       "YourWiFiPassword"    ← your WiFi password
+
+3. In Arduino IDE:
+   - Board:            "ESP32 Dev Module" (or your specific DevKit board)
+   - Upload Speed:      115200
+   - Port:              your USB port (e.g. /dev/ttyUSB0)
+
+4. Click Upload
+5. Wait for "Done uploading"
+
+6. Open Serial Monitor at 115200 baud
+7. Press Reset on the ESP32
+8. Look for this output:
+
+   ┌─────────────────────────────────────────────┐
+   │  THIS ESP32 MAC: AA:BB:CC:DD:EE:FF          │
+   │  ↑↑ Copy this to sender's RECEIVER_MAC! ↑↑  │
+   └─────────────────────────────────────────────┘
+
+9. WRITE DOWN THIS MAC ADDRESS — you need it in Step 5.
+
+---
+
+## STEP 5: CONFIGURE AND FLASH THE ESP32-CAM (SENDER)
+
+1. Open the file:
+   esp32_firmware/esp32_cam_sender/esp32_cam_sender.ino
+
+2. Edit Section 1 (User Configuration) near the top:
+
+   #define WIFI_SSID           "YourWiFiName"        ← SAME WiFi as receiver!
+   #define WIFI_PASSWORD       "YourWiFiPassword"    ← your WiFi password
+   #define ROBOFLOW_API_URL    "https://detect.roboflow.com/YOUR_PROJECT/VERSION"
+   #define ROBOFLOW_API_KEY    "YOUR_API_KEY"
+   #define ROBOFLOW_TARGET_CLASS "ambulance"          ← class name from Roboflow
+   #define MONITORED_LANE_ID   0                      ← lane (0=N, 1=E, 2=S, 3=W)
+   #define LCD_ENABLED         1                      ← 0 if no LCD connected
+
+   And most importantly — set the receiver's MAC address from Step 4:
+   static uint8_t RECEIVER_MAC[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+   ← Replace with YOUR receiver's MAC!
+
+   Example: If receiver MAC is 24:6F:28:AB:CD:EF, set:
+   static uint8_t RECEIVER_MAC[] = {0x24, 0x6F, 0x28, 0xAB, 0xCD, 0xEF};
+
+3. Save the file.
+
+4. In Arduino IDE:
    - Board:            "AI Thinker ESP32-CAM"
    - Partition Scheme:  "Huge APP (3MB No OTA / 1MB SPIFFS)"
    - Upload Speed:      115200
    - Port:              your FTDI adapter (e.g. /dev/ttyUSB0)
 
-2. Connect IO0 to GND on ESP32-CAM (flash mode)
-3. Press Reset button on ESP32-CAM
-4. Click Upload in Arduino IDE
-5. Wait for "Done uploading"
-6. DISCONNECT IO0 from GND
-7. Press Reset button again
+5. Connect IO0 to GND on ESP32-CAM (flash mode)
+6. Press Reset button on ESP32-CAM
+7. Click Upload in Arduino IDE
+8. Wait for "Done uploading"
+9. DISCONNECT IO0 from GND
+10. Press Reset button again
 
 ---
 
-## STEP 6: FIND THE ESP32 IP ADDRESS
+## STEP 6: FIND THE ESP32-CAM IP ADDRESS
 
 1. In Arduino IDE → Tools → Serial Monitor
 2. Set baud rate to 115200
@@ -129,6 +178,9 @@ Open Arduino IDE → Sketch → Include Library → Manage Libraries:
    [HTTP] Trigger URL: http://192.168.1.50/trigger
 
 5. WRITE DOWN THIS IP ADDRESS — you need it in Step 8.
+
+   You should also see:
+   [ESP-NOW] Initialized. Receiver: AA:BB:CC:DD:EE:FF
 
    If you see "[WiFi] FAILED to connect!":
    - Double-check WIFI_SSID and WIFI_PASSWORD in the code
@@ -154,7 +206,7 @@ Open Arduino IDE → Sketch → Include Library → Manage Libraries:
    hostname -I
    → Example output: 192.168.1.105
 
-   Your laptop IP and ESP32 IP should start with the same numbers
+   Your laptop IP and ESP32-CAM IP should start with the same numbers
    (e.g. both start with 192.168.1.xxx). If not, they're on
    different networks and this won't work.
 
@@ -163,11 +215,13 @@ Open Arduino IDE → Sketch → Include Library → Manage Libraries:
 ## STEP 8: RUN THE LOCAL AI + ESP32 SYSTEM
 
 Make sure:
+  ✓ Receiver ESP32 is powered and connected to WiFi (Step 4)
+  ✓ Receiver ESP32 is wired to STM32 (Step 1)
   ✓ ESP32-CAM is powered on and connected to WiFi (Step 6)
   ✓ Laptop venv is activated (Step 7)
-  ✓ You have the ESP32 IP address from Step 6
+  ✓ You have the ESP32-CAM IP address from Step 6
 
-Run this command (replace the IP with YOUR ESP32's IP):
+Run this command (replace the IP with YOUR ESP32-CAM's IP):
 
   python3 src/siren_to_esp32.py --mode wifi --esp32-ip 192.168.1.50 --threshold 0.80
 
@@ -196,24 +250,34 @@ The system is now running! It continuously:
 
    🚨 SIREN DETECTED! [00:15:42.123] confidence=92%
    📡 Triggering ESP32-CAM ambulance verification...
-   ✅ ESP32-CAM triggered! Camera→YOLO→LoRa pipeline running.
+   ✅ ESP32-CAM triggered! Camera→YOLO→ESP-NOW pipeline running.
 
-4. On ESP32 Serial Monitor you should see:
+4. On ESP32-CAM Serial Monitor you should see:
 
    [HTTP] *** TRIGGER from laptop ML! ***
    [1/3] Capturing camera frame...
    [2/3] Sending to Roboflow API...
    [Roboflow] Detection: class="ambulance" conf=0.87
    [Roboflow] ✅ ambulance CONFIRMED!
-   [3/3] AMBULANCE CONFIRMED! Sending LoRa alert...
-   [LoRa] TX: AMB:0
+   [3/3] AMBULANCE CONFIRMED! Sending ESP-NOW alert...
+   [ESP-NOW] TX: AMB:0
+   [ESP-NOW] Send OK to AA:BB:CC:DD:EE:FF
+
+5. On Receiver ESP32 Serial Monitor you should see:
+
+   [ESP-NOW] RX from XX:XX:XX:XX:XX:XX: "AMB:0"
+   ╔══════════════════════════════════════╗
+   ║  AMBULANCE ALERT! Lane 0 (NORTH)
+   ╚══════════════════════════════════════╝
+   [UART] Forwarded to STM32: "AMB:0"
 
 ---
 
 ## STEP 10: STOPPING THE SYSTEM
 
 - On laptop: Press Ctrl+C to stop the Python script
-- ESP32 will keep running (sound sensor fallback still active)
+- ESP32-CAM will keep running (sound sensor fallback still active)
+- Receiver ESP32 keeps running (waiting for ESP-NOW messages)
 - To restart: run the Step 8 command again
 
 ---
@@ -221,7 +285,7 @@ The system is now running! It continuously:
 ## COMMON PROBLEMS AND FIXES
 
 Problem: "ESP32-CAM not reachable"
-Fix:    - Is ESP32 powered on?
+Fix:    - Is ESP32-CAM powered on?
         - Is it on the same WiFi as your laptop?
         - Check the IP in Serial Monitor
         - Try: curl http://192.168.1.50/health
@@ -231,20 +295,36 @@ Fix:    - Run: python3 src/inference_pi.py --list-devices
         - Make sure a microphone is connected / not muted
         - Check system audio settings
 
-Problem: Roboflow returns error on ESP32
+Problem: Roboflow returns error on ESP32-CAM
 Fix:    - Check ROBOFLOW_API_KEY and ROBOFLOW_API_URL in the .ino
-        - Make sure ESP32 has internet access (not just local WiFi)
+        - Make sure ESP32-CAM has internet access (not just local WiFi)
         - Try the API URL in a browser first
 
-Problem: LoRa init fails
-Fix:    - Check SX1278 wiring (GPIO 12, 13, 14, 15, 2, 4)
-        - Make sure it's connected to 3.3V, NOT 5V
+Problem: ESP-NOW send fails
+Fix:    - Both ESP32s must be on the SAME WiFi network
+        - Double-check the receiver MAC address in sender code
+        - Make sure WiFi is 2.4 GHz (not 5 GHz)
+
+Problem: Receiver not getting messages
+Fix:    - Verify MAC address (printed on receiver Serial Monitor)
+        - Ensure both ESP32s are powered and WiFi connected
+        - Check that both use the same WiFi SSID
+
+Problem: STM32 not responding to alerts
+Fix:    - Check UART wiring: ESP32 GPIO 17 → STM32 PB11
+        - Check GND is connected between ESP32 and STM32
+        - Open STM32 serial monitor to see if messages arrive
+
+Problem: LCD is blank or not showing anything
+Fix:    - Check SDA/SCL wiring
+        - Try changing LCD_I2C_ADDR to 0x3F in the code
+        - Set LCD_ENABLED to 0 if you don't have an LCD
 
 Problem: Permission denied on /dev/ttyUSB0
 Fix:    - Run: sudo usermod -aG dialout $USER
         - Log out and log back in
 
-Problem: ESP32 says "[WiFi] FAILED"
+Problem: ESP32-CAM says "[WiFi] FAILED"
 Fix:    - ESP32 only works with 2.4 GHz WiFi (not 5 GHz)
         - Check SSID and password — they are case sensitive
 
@@ -258,10 +338,14 @@ Laptop files:
   models/emergency_detector.tflite ← Trained AI model
   models/class_names.txt         ← Class labels (emergency, non_emergency)
 
-ESP32 firmware:
-  esp32_firmware/ambulance_detector/ambulance_detector.ino  ← Flash this to ESP32
+ESP32-CAM (Sender) firmware:
+  esp32_firmware/esp32_cam_sender/esp32_cam_sender.ino  ← Flash this to ESP32-CAM
+
+Receiver ESP32 firmware:
+  esp32_firmware/stm32_esp32_receiver/stm32_esp32_receiver.ino  ← Flash this to ESP32 DevKit
 
 Documentation:
   README.md                      ← Project overview
   INSTRUCTIONS.md                ← Setup instructions
-  ESP32_PROCEDURE.txt            ← This file
+  WIRING.md                      ← Complete wiring guide
+  ESP32_PROCEDURE.txt            ← This file (step-by-step)

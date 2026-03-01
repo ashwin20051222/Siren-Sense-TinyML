@@ -9,8 +9,8 @@ detection pipeline via WiFi (HTTP) or UART (serial).
 
 The ESP32-CAM then:
   1. Captures a camera image
-  2. Sends it to YOLO API for ambulance confirmation
-  3. If confirmed, transmits LoRa alert to STM32 traffic controller
+  2. Sends it to Roboflow API for ambulance confirmation
+  3. If confirmed, sends ESP-NOW alert to receiver ESP32 → UART → STM32
 
 Modes:
     wifi  — sends HTTP GET to http://ambulance.local/trigger (auto-discovered)
@@ -72,7 +72,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Default mDNS hostname (must match MDNS_HOSTNAME in ambulance_detector.ino)
+# Default mDNS hostname (must match MDNS_HOSTNAME in esp32_cam_sender.ino)
 MDNS_HOSTNAME = "ambulance"
 
 
@@ -336,9 +336,9 @@ def run_siren_detector(
             logger.info("✅ ESP32-CAM is reachable at %s", esp32_ip)
             status = get_esp32_status(esp32_ip, http_port)
             if status:
-                logger.info("  Camera: %s | LoRa: %s | Lane: %s",
+                logger.info("  Camera: %s | ESP-NOW: %s | Lane: %s",
                     "OK" if status.get("camera") else "FAIL",
-                    "OK" if status.get("lora") else "FAIL",
+                    "OK" if status.get("esp_now") else "FAIL",
                     status.get("lane_id", "?"))
         else:
             logger.warning("⚠️  ESP32-CAM not reachable at %s. Will keep trying.", esp32_ip)
@@ -419,7 +419,7 @@ def run_siren_detector(
                 success = trigger_esp32(trigger_mode, esp32_ip, http_port)
                 if success:
                     trigger_count += 1
-                    print("  ✅ ESP32-CAM triggered! Camera→YOLO→LoRa pipeline running.\n")
+                    print("  ✅ ESP32-CAM triggered! Camera→Roboflow→ESP-NOW pipeline running.\n")
                 else:
                     print("  ❌ Failed to reach ESP32-CAM! Check connection.\n")
 
@@ -449,7 +449,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run ML siren detection on laptop mic. "
-            "When detected, trigger ESP32-CAM for camera→YOLO→LoRa ambulance verification."
+            "When detected, trigger ESP32-CAM for camera→Roboflow→ESP-NOW ambulance verification."
         ),
     )
     parser.add_argument(
