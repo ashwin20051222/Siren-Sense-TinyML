@@ -15,7 +15,8 @@
 │   Laptop ML ──WiFi──→ ESP32-CAM ──→ Roboflow API (WiFi)            │
 │   Sound Sensor ──→    OV2640 cam     ambulance? yes/no              │
 │                           │                                          │
-│                    ESP-NOW WiFi TX ── "AMB:0" ──┐                   │
+│         ESP-NOW WiFi TX (MAC address paired) ── "AMB:0" ──┐        │
+│         Sender MAC: A8:42:E3:56:83:2C                      │        │
 └──────────────────────────────────────────────────┬──────────────────┘
                                         ESP-NOW RF │ (~100–200m range)
 ┌──────────────────────────────────────────────────┼──────────────────┐
@@ -28,9 +29,9 @@
 │                 NUCLEO-F103RB (STM32)                                │
 │                    │    │    │    │                                   │
 │              ┌─────┘    │    │    └─────────┐                        │
-│         4× Traffic   4× Ped  LCD     IR Sensors                     │
-│          Light LEDs  Buttons  16×2   (optional)                     │
-│          (R/Y/G)     + LEDs   I2C                                   │
+│         4× Traffic   4× Ped  LCD 16×2  IR Sensors                   │
+│          Light LEDs  Buttons  I2C      (optional)                   │
+│          (R/Y/G)     + LEDs   PC6/PC7                               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,15 +83,24 @@
 | West Button      | **PB8**   | Push button → GND             |
 | North Ped 🔴 Red   | **PB9**   | Red LED → 220Ω → GND       |
 | North Ped 🟢 Green | **PB4**   | Green LED → 220Ω → GND     |
-| East Ped 🔴 Red    | **PB3**   | Red LED → 220Ω → GND       |
+| East Ped 🔴 Red    | **PC2**   | Red LED → 220Ω → GND       |
 | East Ped 🟢 Green  | **PB12**  | Green LED → 220Ω → GND     |
 | South Ped 🔴 Red   | **PC0**   | Red LED → 220Ω → GND       |
 | South Ped 🟢 Green | **PC1**   | Green LED → 220Ω → GND     |
 | West Ped 🔴 Red    | **PC4**   | Red LED → 220Ω → GND       |
 | West Ped 🟢 Green  | **PC5**   | Green LED → 220Ω → GND     |
 
+**IR Sensors (GPIO_Input, Pull-Up, Active-Low)**
+
+| Signal | STM32 Pin | Connection |
+|--------|-----------|------------|
+| IR North | **PC11** | IR sensor OUT → PC11 (sensor GND → GND, VCC → 3.3V) |
+| IR East  | **PC12** | IR sensor OUT → PC12 |
+| IR South | **PD2**  | IR sensor OUT → PD2  |
+| IR West  | **PA12** | IR sensor OUT → PA12 |
+
 > [!NOTE]
-> PB10/PB11 are reserved for USART3 (ESP32 communication). North Ped Green moved to PB4, East Ped Red moved to PB3.
+> PB10/PB11 are reserved for USART3 (ESP32 communication). PB4 freed by JTAG disable for North Ped Green. East Ped Red moved from PB3 (JTDO, conflicts with CubeMX) to **PC2** (free GPIO). IR sensors use Pull-Up input mode — sensor pulls LOW when vehicle detected.
 
 **Total: 4 push buttons + 8 LEDs + 8× 220Ω resistors**
 
@@ -179,19 +189,8 @@ The camera is fixed on the AI-Thinker board via ribbon cable. **Do not modify.**
 
 ---
 
-## 2.3 I2C LCD Display (16×2) → ESP32-CAM (Optional)
-
-> Shares GPIO 26/27 with the camera's SCCB bus. Uses Wire1 (second I2C peripheral) so there's no conflict with the camera driver.
-
-| LCD Pin | ESP32-CAM GPIO | Notes                              |
-|---------|----------------|--------------------------------------|
-| SDA     | **GPIO 26**    | Shared with camera SIOD            |
-| SCL     | **GPIO 27**    | Shared with camera SIOC            |
-| VCC     | **5V**         | Power (via backpack regulator)     |
-| GND     | **GND**        | Ground                             |
-
 > [!NOTE]
-> The LCD uses a PCF8574 I2C backpack (default address: 0x27). If blank, try 0x3F. Set `LCD_I2C_ADDR` in the firmware. Set `LCD_ENABLED 0` to disable.
+> No LCD is connected to the ESP32-CAM. The 16×2 LCD display is on the STM32F103RB only.
 
 ---
 
@@ -225,18 +224,12 @@ The camera is fixed on the AI-Thinker board via ribbon cable. **Do not modify.**
 
 ---
 
-## 3.2 I2C LCD Display (16×2) → ESP32 Receiver (Optional)
-
-| LCD Pin | ESP32 GPIO   | Notes                     |
-|---------|-------------|---------------------------|
-| SDA     | **GPIO 21** | Default I2C SDA           |
-| SCL     | **GPIO 22** | Default I2C SCL           |
-| VCC     | **5V**      | Power                     |
-| GND     | **GND**     | Ground                    |
+> [!NOTE]
+> No LCD is connected to the receiver ESP32. The 16×2 LCD display is on the STM32F103RB only.
 
 ---
 
-## 3.3 Power
+## 3.2 Power
 
 The ESP32 DevKit is powered via its USB port. No special power supply needed.
 
@@ -244,13 +237,29 @@ The ESP32 DevKit is powered via its USB port. No special power supply needed.
 
 # 📡 PART 4: ESP-NOW WiFi Link (ESP32-CAM ↔ ESP32 Receiver)
 
-The two ESP32 boards communicate wirelessly using **ESP-NOW** (built-in WiFi protocol). No extra hardware needed!
+The two ESP32 boards communicate wirelessly using **ESP-NOW** (built-in WiFi protocol), with **automatic pairing** via beacon broadcast + hardcoded MAC fallback. Use `esp32_firmware/find_mac_address/find_mac_address.ino` to discover your board's MAC.
 
-### How ESP-NOW Works
+### Current MAC Addresses
+
+| Board | MAC Address |
+|-------|-------------|
+| ESP32-CAM (Sender) | `A8:42:E3:56:83:2C` |
+| ESP32 DevKit (Receiver) | `FC:E8:C0:7A:B7:A0` |
+
+### How Auto-Pairing Works
+
+1. **Receiver** boots → broadcasts `"PAIR:RCV"` beacon every 2 seconds (MAC: `FC:E8:C0:7A:B7:A0`)
+2. **Sender** boots → listens for beacon, auto-discovers receiver's MAC (MAC: `A8:42:E3:56:83:2C`)
+3. **Sender** sends `"PAIR:ACK"` → both boards are paired!
+4. If auto-pairing times out (30s), sender falls back to hardcoded receiver MAC
+5. LED blinks fast during pairing, brief solid flash confirms paired
+
+### ESP-NOW Specs
 
 | Feature          | Value                           |
 |------------------|---------------------------------|
 | Protocol         | ESP-NOW (built into ESP-IDF)    |
+| Pairing          | **Automatic** (beacon broadcast)|
 | Range            | ~100–200m (line of sight)       |
 | Latency          | < 5ms                           |
 | Encryption       | Optional (disabled by default)  |
@@ -259,21 +268,16 @@ The two ESP32 boards communicate wirelessly using **ESP-NOW** (built-in WiFi pro
 
 ### Setup Steps
 
-1. **Flash the receiver ESP32 first** (`stm32_esp32_receiver.ino`)
-2. Open Serial Monitor at 115200 baud
-3. Look for this line:
+1. **Flash the MAC finder first** (optional): `esp32_firmware/find_mac_address/find_mac_address.ino`
+2. **Flash the receiver ESP32** (`stm32_esp32_receiver.ino`)
+3. Open Serial Monitor at 115200 baud
+4. Look for this line:
    ```
-   ┌─────────────────────────────────────────────┐
-   │  THIS ESP32 MAC: AA:BB:CC:DD:EE:FF          │
-   │  ↑↑ Copy this to sender's RECEIVER_MAC! ↑↑  │
-   └─────────────────────────────────────────────┘
+   [Info] This ESP32 MAC: FC:E8:C0:7A:B7:A0
+   [PAIR] Beacon sent: "PAIR:RCV" (waiting for sender...)
    ```
-4. Copy the MAC address
-5. Edit `esp32_cam_sender.ino` — update `RECEIVER_MAC`:
-   ```cpp
-   static uint8_t RECEIVER_MAC[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
-   ```
-6. Flash the ESP32-CAM sender
+5. Flash the ESP32-CAM sender (`esp32_cam_sender.ino`)
+6. WiFi (`Vivo_V29_5G`) and MAC addresses are pre-configured
 
 ### Message Protocol
 
@@ -285,7 +289,7 @@ STM32 action:      Makes North lane green for 15s, all others red
 ```
 
 > [!IMPORTANT]
-> Both ESP32 boards must connect to the **same WiFi network** (same 2.4 GHz SSID). ESP-NOW uses the WiFi channel, so they must be on the same channel. Connecting to the same network ensures this automatically.
+> Both ESP32 boards must connect to the **same WiFi network** (`Vivo_V29_5G`, 2.4 GHz). ESP-NOW uses the WiFi channel, so they must be on the same channel. Connecting to the same network ensures this automatically.
 
 ---
 
@@ -302,12 +306,10 @@ STM32 action:      Makes North lane green for 15s, all others red
 | | | | |
 | ESP32-CAM (Sender)   | 5V      | ~310 mA     | External 5V/2A supply      |
 | Sound Sensor         | 3.3V    | ~5 mA       | ESP32-CAM 3.3V             |
-| LCD 16×2 (ESP32-CAM) | 5V      | ~40 mA      | ESP32-CAM 5V pin           |
-| **ESP32-CAM Total**  |         | **~355 mA** | **Dedicated power supply** |
+| **ESP32-CAM Total**  |         | **~315 mA** | **Dedicated power supply** |
 | | | | |
 | ESP32 DevKit (Recv)  | 5V USB  | ~80 mA      | USB port on STM32/laptop   |
-| LCD 16×2 (Receiver)  | 5V      | ~40 mA      | ESP32 DevKit 5V pin        |
-| **Receiver Total**   |         | **~120 mA** | **USB power sufficient**   |
+| **Receiver Total**   |         | **~80 mA**  | **USB power sufficient**   |
 
 ---
 
@@ -320,7 +322,7 @@ STM32 action:      Makes North lane green for 15s, all others red
   ┌─────────────────────┐       ┌─────────────────────┐
   │ PA0  = TL1 Red      │       │ PB0  = (free)       │
   │ PA1  = TL1 Yellow   │       │ PB1  = (free)       │
-  │ PA2  = Debug TX ⚡  │       │ PB3  = Ped E Red    │
+  │ PA2  = Debug TX ⚡  │       │ PB3  = (free)       │
   │ PA3  = Debug RX ⚡  │       │ PB4  = Ped N Green  │
   │ PA4  = (free)       │       │ PB5  = Ped Btn N    │
   │ PA5  = (free)       │       │ PB6  = Ped Btn E    │
@@ -330,26 +332,26 @@ STM32 action:      Makes North lane green for 15s, all others red
   │ PA9  = TL2 Red      │       │ PB10 = USART3 TX ⚡ │
   │ PA10 = TL2 Yellow   │       │ PB11 = USART3 RX ⚡ │
   │ PA11 = TL2 Green    │       │ PB12 = Ped E Green  │
-  │ PA12 = IR West      │       │ PB13 = TL3 Red      │
+  │ PA12 = IR West 🟡  │       │ PB13 = TL3 Red      │
   │ PA15 = (free)       │       │ PB14 = TL3 Yellow   │
   └─────────────────────┘       │ PB15 = TL3 Green    │
                                 └─────────────────────┘
            PC Pins                        PD Pins
   ┌─────────────────────┐       ┌─────────────────────┐
-  │ PC0  = Ped S Red    │       │ PD2  = IR South     │
+  │ PC0  = Ped S Red    │       │ PD2  = IR South 🟡 │
   │ PC1  = Ped S Green  │       └─────────────────────┘
-  │ PC2  = (free)       │
+  │ PC2  = Ped E Red    │
   │ PC3  = (free)       │
   │ PC4  = Ped W Red    │
   │ PC5  = Ped W Green  │
-  │ PC6  = LCD SDA      │
-  │ PC7  = LCD SCL      │
+  │ PC6  = LCD SDA 🟣   │
+  │ PC7  = LCD SCL 🟣   │
   │ PC8  = TL4 Red      │
   │ PC9  = TL4 Yellow   │
   │ PC10 = TL4 Green    │
-  │ PC11 = IR North     │
-  │ PC12 = IR East      │
-  │ PC13 = User LED ⚡  │
+  │ PC11 = IR North 🟡 │
+  │ PC12 = IR East 🟡  │
+  │ PC13 = User LED 🟡 │
   └─────────────────────┘
 ```
 
@@ -373,7 +375,7 @@ STM32 action:      Makes North lane green for 15s, all others red
              └──────────────────┘
 
   Note: GPIO 12-15 are now FREE (no LoRa module needed!)
-  LCD uses GPIO 26/27 (camera SCCB pins, via Wire1)
+  No LCD on ESP32-CAM (LCD is on STM32 only)
 ```
 
 ## ESP32 DevKit (Receiver)
@@ -385,12 +387,14 @@ STM32 action:      Makes North lane green for 15s, all others red
        5V ───┤ VIN         GND ├─── GND (→ STM32 GND)
       GND ───┤ GND    GPIO  17 ├─── STM32 PB11 (USART3 RX)
              │ ...    GPIO  16 ├─── STM32 PB10 (USART3 TX, optional)
-             │        GPIO  21 ├─── LCD SDA (optional)
-             │        GPIO  22 ├─── LCD SCL (optional)
+             │        GPIO  21 ├─── (free)
+             │        GPIO  22 ├─── (free)
              │        GPIO   2 ├─── Built-in LED
              │                  │
              │    [USB PORT]    │
              └──────────────────┘
+
+  Note: No LCD on receiver ESP32 (LCD is on STM32 only)
 ```
 
 ---
@@ -402,11 +406,10 @@ After wiring, verify each subsystem:
 - [ ] **STM32 boots** — Blue user LED blinks, serial output at 115200 baud
 - [ ] **Traffic LEDs cycle** — N→E→S→W round-robin (10s green, 3s yellow, 1s all-red)
 - [ ] **Pedestrian buttons** — Press any button, walk phase activates after current green
-- [ ] **LCD (STM32)** — Shows countdown timers for each lane
+- [ ] **LCD (STM32 only)** — Shows countdown timers for each lane on 16×2 I2C LCD (PC6/PC7)
 - [ ] **ESP32-CAM boots** — Serial shows WiFi ✅, Camera ✅, ESP-NOW ✅
-- [ ] **ESP32-CAM MAC** — Serial prints `ESP32-CAM MAC: XX:XX:XX:XX:XX:XX`
-- [ ] **Receiver ESP32 boots** — Serial shows WiFi ✅, ESP-NOW ✅, MAC address printed
-- [ ] **Receiver MAC copied** — MAC from receiver's Serial Monitor → sender's `RECEIVER_MAC`
+- [ ] **Receiver ESP32 boots** — Serial shows WiFi ✅, ESP-NOW ✅, broadcasting beacon
+- [ ] **Auto-pairing** — Sender discovers receiver automatically, both show "PAIRED" in Serial
 - [ ] **ESP-NOW link** — Trigger pipeline on ESP32-CAM → receiver Serial shows `AMB:0` received
 - [ ] **UART bridge** — Receiver's `AMB:0` message appears on STM32 serial
 - [ ] **End-to-end** — Play siren → laptop detects → ESP32 camera → Roboflow → ESP-NOW → receiver → STM32 → ambulance lane goes green

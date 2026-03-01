@@ -1,29 +1,36 @@
 /**
  * ============================================================================
- *  ESP32-CAM Sender — Ambulance Detection + ESP-NOW WiFi Transmitter
- *  Board: ESP32-CAM (AI-Thinker) + Sound Sensor + I2C LCD
+ * ESP32-CAM Sender — Ambulance Detection + ESP-NOW WiFi Transmitter
+ * Board: ESP32-CAM (AI-Thinker) + Sound Sensor
  * ============================================================================
  *
- *  SYSTEM ARCHITECTURE (Two-ESP32 WiFi):
- *    ┌─────────────────────────────────────────────────────────────┐
- *    │  ESP32-CAM (THIS BOARD)                                    │
- *    │  Laptop ML / Sound Sensor → Camera → Roboflow API          │
- *    │  → ESP-NOW TX → Receiver ESP32 → UART → STM32             │
- *    └─────────────────────────────────────────────────────────────┘
+ * SYSTEM ARCHITECTURE (Two-ESP32 WiFi):
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │  ESP32-CAM (THIS BOARD) — MAC: A8:42:E3:56:83:2C        │
+ * │  Laptop ML / Sound Sensor → Camera → Roboflow API          │
+ * │  → ESP-NOW TX → Receiver ESP32 (FC:E8:C0:7A:B7:A0)       │
+ * │  → UART → STM32                                           │
+ * └─────────────────────────────────────────────────────────────┘
  *
- *  DETECTION PIPELINE:
- *    Laptop ML Audio / Sound Sensor → Camera → Roboflow API → ESP-NOW →
+ * MAC ADDRESSES:
+ * This board (Sender):    A8:42:E3:56:83:2C
+ * Receiver (ESP32 DevKit): FC:E8:C0:7A:B7:A0
+ * Use esp32_firmware/find_mac_address/ sketch to find your board's MAC.
+ *
+ * DETECTION PIPELINE:
+ * Laptop ML Audio / Sound Sensor → Camera → Roboflow API → ESP-NOW →
  * Receiver
  *
- *  ENDPOINTS (WiFi):
- *    GET /trigger  → start pipeline    GET /status → JSON status
- *    GET /health   → "OK"
+ * ENDPOINTS (WiFi):
+ * GET /trigger  → start pipeline    GET /status → JSON status
+ * GET /health   → "OK"
  *
- *  LIBRARIES (Arduino Library Manager):
- *    - ArduinoJson by Benoit Blanchon (v6.x or v7.x)
- *    - ESP32 Board Package (esp32 by Espressif, v2.x+)
+ * LIBRARIES (Arduino Library Manager):
+ * - ArduinoJson by Benoit Blanchon (v6.x or v7.x)
+ * - ESP32 Board Package (esp32 by Espressif, v2.x+)
  *
- *  LAPTOP: python3 src/siren_to_esp32.py --mode wifi --esp32-ip <THIS_IP>
+ * WiFi: Vivo_V29_5G (2.4 GHz) — both boards must be on the SAME network.
+ * LAPTOP: python3 src/siren_to_esp32.py --mode wifi --esp32-ip <THIS_IP>
  * ============================================================================
  */
 
@@ -34,7 +41,6 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <WiFi.h>
-#include <Wire.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 
@@ -43,27 +49,33 @@
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 /* ---- WiFi (2.4 GHz only) ---- */
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID "Vivo_V29_5G"
+#define WIFI_PASSWORD "123456789"
 
 /* ---- Roboflow API ----
- *  URL: https://detect.roboflow.com/<PROJECT>/<VERSION>
- *  Get API key from: https://app.roboflow.com → Deploy → Hosted API */
-#define ROBOFLOW_API_URL "https://detect.roboflow.com/YOUR_PROJECT/YOUR_VERSION"
+ * URL: https://detect.roboflow.com/<PROJECT>/<VERSION>
+ * Get API key from: https://app.roboflow.com → Deploy → Hosted API */
+#define ROBOFLOW_API_URL                                                       \
+  "https://detect.roboflow.com/ambulance-detection-md0u4/3"
 #define ROBOFLOW_API_KEY "YOUR_ROBOFLOW_API_KEY"
 #define ROBOFLOW_TIMEOUT_MS 15000
 #define ROBOFLOW_CONF_MIN 0.60
-#define ROBOFLOW_TARGET_CLASS "ambulance"
+#define ROBOFLOW_TARGET_CLASS "Ambulance"
 
 /* ---- Lane ID: 0=North, 1=East, 2=South, 3=West ---- */
 #define MONITORED_LANE_ID 0
 
-/* ---- ESP-NOW Receiver MAC Address ----
- *  Flash stm32_esp32_receiver.ino first, then copy the MAC address
- *  from its Serial Monitor output. Format: {0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX}
- *  Example: {0x24, 0x6F, 0x28, 0xAB, 0xCD, 0xEF} */
-static uint8_t RECEIVER_MAC[] = {0xFF, 0xFF, 0xFF,
-                                 0xFF, 0xFF, 0xFF}; // ← CHANGE THIS!
+/* ---- ESP-NOW Auto-Pairing ----
+ * The sender automatically discovers the receiver by listening for its
+ * "PAIR:RCV" beacon broadcasts. Hardcoded MAC is used as a fallback.
+ * Receiver MAC: FC:E8:C0:7A:B7:A0 */
+#define PAIR_BEACON_MSG "PAIR:RCV" /* Beacon from receiver */
+#define PAIR_ACK_MSG "PAIR:ACK"    /* ACK sent back to receiver */
+#define PAIR_TIMEOUT_MS 30000      /* Max wait time for pairing (30s) */
+
+/* ---- Hardcoded Receiver MAC (fallback if auto-pairing fails) ---- */
+static const uint8_t HARDCODED_RECEIVER_MAC[] = {0xFC, 0xE8, 0xC0,
+                                                 0x7A, 0xB7, 0xA0};
 
 /* ---- Sound Sensor (GPIO 33, ADC1_CH5) ---- */
 #define SOUND_SENSOR_PIN 33
@@ -82,14 +94,7 @@ static uint8_t RECEIVER_MAC[] = {0xFF, 0xFF, 0xFF,
 #define ESPNOW_RETRY_DELAY_MS 300
 #define CAMERA_WARMUP_MS 500
 
-/* ---- LCD Display (16×2 I2C, PCF8574 backpack) ----
- *  SDA/SCL share GPIO 26/27 with camera SCCB (uses Wire1, no conflict)
- *  Set LCD_ENABLED to 0 if no LCD connected */
-#define LCD_ENABLED 1
-#define LCD_I2C_ADDR 0x27
-#define LCD_SDA_PIN 26
-#define LCD_SCL_PIN 27
-#define LCD_REFRESH_MS 500
+/* NOTE: LCD display is on the STM32F103RB (PC6/PC7), NOT this ESP32-CAM. */
 
 /* ---- Traffic Timing (mirrors STM32 — keep in sync!) ---- */
 #define GREEN_DURATION_MS 10000
@@ -132,114 +137,6 @@ static uint8_t RECEIVER_MAC[] = {0xFF, 0xFF, 0xFF,
 #define PCLK_GPIO_NUM 22
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 3: LCD I2C DRIVER (self-contained, no library needed)  ║
- * ╚═══════════════════════════════════════════════════════════════════╝ */
-
-/* PCF8574 backpack bits */
-#define LCD_BL_BIT 0x08
-#define LCD_EN_BIT 0x04
-#define LCD_RW_BIT 0x02
-#define LCD_RS_BIT 0x01
-
-/* HD44780 commands */
-#define LCD_CMD_CLEAR 0x01
-#define LCD_CMD_HOME 0x02
-#define LCD_CMD_ENTRY_MODE 0x06
-#define LCD_CMD_DISPLAY_ON 0x0C
-#define LCD_CMD_FUNC_4BIT 0x28
-#define LCD_CMD_SET_DDRAM 0x80
-#define LCD_LINE0_ADDR 0x00
-#define LCD_LINE1_ADDR 0x40
-
-static TwoWire LCDWire = TwoWire(1);
-static bool lcdReady = false;
-
-static void lcd_i2c_write(uint8_t data) {
-  LCDWire.beginTransmission(LCD_I2C_ADDR);
-  LCDWire.write(data);
-  LCDWire.endTransmission();
-}
-
-static void lcd_pulse_enable(uint8_t data) {
-  lcd_i2c_write(data | LCD_EN_BIT);
-  delayMicroseconds(1);
-  lcd_i2c_write(data & ~LCD_EN_BIT);
-  delayMicroseconds(50);
-}
-
-static void lcd_send_nibble(uint8_t nibble, uint8_t mode) {
-  lcd_pulse_enable((nibble & 0xF0) | mode | LCD_BL_BIT);
-}
-
-static void lcd_send_byte(uint8_t value, uint8_t mode) {
-  lcd_send_nibble(value & 0xF0, mode);
-  lcd_send_nibble((value << 4) & 0xF0, mode);
-}
-
-static void lcd_command(uint8_t cmd) {
-  lcd_send_byte(cmd, 0);
-  if (cmd <= 0x02)
-    delay(2);
-}
-
-static void lcd_data(uint8_t ch) { lcd_send_byte(ch, LCD_RS_BIT); }
-
-static bool LCD_Init(void) {
-#if LCD_ENABLED == 0
-  return false;
-#endif
-  LCDWire.begin(LCD_SDA_PIN, LCD_SCL_PIN, 100000);
-  delay(50);
-  lcd_send_nibble(0x30, 0);
-  delay(5);
-  lcd_send_nibble(0x30, 0);
-  delay(5);
-  lcd_send_nibble(0x30, 0);
-  delay(1);
-  lcd_send_nibble(0x20, 0);
-  delay(1);
-  lcd_command(LCD_CMD_FUNC_4BIT);
-  lcd_command(LCD_CMD_DISPLAY_ON);
-  lcd_command(LCD_CMD_CLEAR);
-  lcd_command(LCD_CMD_ENTRY_MODE);
-  lcdReady = true;
-  return true;
-}
-
-static void LCD_Clear(void) {
-  if (lcdReady)
-    lcd_command(LCD_CMD_CLEAR);
-}
-
-static void LCD_SetCursor(uint8_t row, uint8_t col) {
-  if (!lcdReady)
-    return;
-  lcd_command(LCD_CMD_SET_DDRAM |
-              ((row ? LCD_LINE1_ADDR : LCD_LINE0_ADDR) + col));
-}
-
-static void LCD_Print(const char *str) {
-  if (!lcdReady || !str)
-    return;
-  for (uint8_t i = 0; *str && i < 16; i++)
-    lcd_data((uint8_t)*str++);
-}
-
-static void LCD_PrintPadded(const char *str) {
-  if (!lcdReady || !str)
-    return;
-  uint8_t i = 0;
-  while (*str && i < 16) {
-    lcd_data((uint8_t)*str++);
-    i++;
-  }
-  while (i < 16) {
-    lcd_data(' ');
-    i++;
-  }
-}
-
-/* ╔═══════════════════════════════════════════════════════════════════╗
  * ║  SECTION 4: GLOBAL STATE                                        ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
@@ -248,7 +145,12 @@ static const char *LANE_NAMES[] = {"NORTH", "EAST", "SOUTH", "WEST"};
 static bool wifiConnected = false;
 static bool espNowInitialized = false;
 static bool cameraInitialized = false;
-static bool lcdInitialized = false;
+
+/* ESP-NOW auto-pairing state */
+static bool receiverPaired = false;
+static uint8_t receiverMAC[6] = {0};
+static volatile bool pairBeaconReceived = false;
+static uint8_t pendingPairMAC[6] = {0};
 
 /* ESP-NOW send status */
 static volatile bool espNowSendSuccess = false;
@@ -279,8 +181,6 @@ static TrafficSimPhase_t tsimPhase = TSIM_GREEN;
 static uint8_t tsimActiveLane = 0;
 static uint32_t tsimPhaseStartMs = 0;
 static uint8_t tsimAmbulanceLane = 0;
-static uint32_t lastLcdUpdate = 0;
-
 /* HTTP trigger server */
 #if TRIGGER_MODE == 0 || TRIGGER_MODE == 2
 WebServer httpServer(HTTP_TRIGGER_PORT);
@@ -342,7 +242,7 @@ void handleStatus(void) {
   doc["wifi"] = (WiFi.status() == WL_CONNECTED);
   doc["camera"] = cameraInitialized;
   doc["esp_now"] = espNowInitialized;
-  doc["lcd"] = lcdInitialized;
+  doc["lcd"] = "on_stm32";
   doc["in_cooldown"] = inCooldown;
   doc["total_triggers"] = totalTriggers;
   doc["ambulances_found"] = ambulancesFound;
@@ -481,12 +381,32 @@ camera_fb_t *captureFrame(void) {
  * ║  SECTION 9: ESP-NOW SENDER                                     ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
-/* ESP-NOW send callback */
-void onEspNowSend(const uint8_t *mac_addr, esp_now_send_status_t status) {
+/* ESP-NOW send callback (Updated for ESP32 Core v3.x API) */
+void onEspNowSend(const esp_now_send_info_t *info,
+                  esp_now_send_status_t status) {
   espNowSendSuccess = (status == ESP_NOW_SEND_SUCCESS);
-  DBG("[ESP-NOW] Send %s to %02X:%02X:%02X:%02X:%02X:%02X\n",
-      espNowSendSuccess ? "OK" : "FAIL", mac_addr[0], mac_addr[1], mac_addr[2],
-      mac_addr[3], mac_addr[4], mac_addr[5]);
+  DBG("[ESP-NOW] Send %s\n", espNowSendSuccess ? "OK" : "FAIL");
+}
+
+/* ESP-NOW receive callback — listens for pairing beacons from receiver (Updated
+ * for v3.x API) */
+void onEspNowReceive(const esp_now_recv_info *info, const uint8_t *data,
+                     int len) {
+  const uint8_t *mac_addr = info->src_addr;
+  if (len <= 0 || len >= 32)
+    return;
+
+  char msg[32];
+  memcpy(msg, data, len);
+  msg[len] = '\0';
+
+  /* Check for PAIR:RCV beacon from receiver */
+  if (!receiverPaired && strcmp(msg, PAIR_BEACON_MSG) == 0) {
+    memcpy(pendingPairMAC, mac_addr, 6);
+    pairBeaconReceived = true;
+    DBG("[PAIR] Beacon from %02X:%02X:%02X:%02X:%02X:%02X\n", mac_addr[0],
+        mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+  }
 }
 
 bool initEspNow(void) {
@@ -496,32 +416,96 @@ bool initEspNow(void) {
   }
 
   esp_now_register_send_cb(onEspNowSend);
+  esp_now_register_recv_cb(onEspNowReceive);
 
-  /* Add receiver as peer */
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, RECEIVER_MAC, 6);
-  peerInfo.channel = 0; /* Use current WiFi channel */
-  peerInfo.encrypt = false;
+  /* Add broadcast peer (needed to send PAIR:ACK back) */
+  esp_now_peer_info_t bcastPeer = {};
+  memset(bcastPeer.peer_addr, 0xFF, 6);
+  bcastPeer.channel = 0;
+  bcastPeer.encrypt = false;
+  esp_now_add_peer(&bcastPeer);
 
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    DBGLN("[ESP-NOW] Failed to add peer!");
-    return false;
-  }
-
-  DBG("[ESP-NOW] Initialized. Receiver: %02X:%02X:%02X:%02X:%02X:%02X\n",
-      RECEIVER_MAC[0], RECEIVER_MAC[1], RECEIVER_MAC[2], RECEIVER_MAC[3],
-      RECEIVER_MAC[4], RECEIVER_MAC[5]);
+  DBGLN("[ESP-NOW] Initialized. Listening for receiver beacon...");
   return true;
 }
 
+/* Auto-pairing: wait for receiver's PAIR:RCV beacon, then add it as peer */
+bool autoDiscoverReceiver(void) {
+  DBGLN("[PAIR] Searching for receiver...");
+  uint32_t startMs = millis();
+
+  while (!receiverPaired && (millis() - startMs) < PAIR_TIMEOUT_MS) {
+    /* Fast-blink built-in LED (GPIO 33 on ESP32-CAM has no LED, use serial) */
+    if ((millis() / 500) % 2)
+      DBG(".");
+
+    if (pairBeaconReceived) {
+      pairBeaconReceived = false;
+
+      /* Save receiver MAC */
+      memcpy(receiverMAC, pendingPairMAC, 6);
+
+      /* Add receiver as unicast peer */
+      esp_now_peer_info_t peerInfo = {};
+      memcpy(peerInfo.peer_addr, receiverMAC, 6);
+      peerInfo.channel = 0;
+      peerInfo.encrypt = false;
+
+      if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        DBGLN("[PAIR] Failed to add receiver peer!");
+        continue;
+      }
+
+      /* Send PAIR:ACK to confirm pairing */
+      esp_now_send(receiverMAC, (uint8_t *)PAIR_ACK_MSG, strlen(PAIR_ACK_MSG));
+      delay(100);
+
+      receiverPaired = true;
+      DBG("\n[PAIR] PAIRED with receiver: %02X:%02X:%02X:%02X:%02X:%02X\n",
+          receiverMAC[0], receiverMAC[1], receiverMAC[2], receiverMAC[3],
+          receiverMAC[4], receiverMAC[5]);
+      return true;
+    }
+
+    delay(100);
+  }
+
+  DBGLN("\n[PAIR] Timeout! No receiver found within 30 seconds.");
+  DBGLN("[PAIR] Falling back to hardcoded MAC: FC:E8:C0:7A:B7:A0");
+
+  /* Use hardcoded receiver MAC as fallback */
+  memcpy(receiverMAC, HARDCODED_RECEIVER_MAC, 6);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+    receiverPaired = true;
+    DBG("[PAIR] Fallback paired with: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        receiverMAC[0], receiverMAC[1], receiverMAC[2], receiverMAC[3],
+        receiverMAC[4], receiverMAC[5]);
+    return true;
+  }
+
+  DBGLN("[PAIR] Fallback pairing also failed!");
+  return false;
+}
+
 bool sendAmbulanceAlert(uint8_t laneId) {
+  if (!receiverPaired) {
+    DBGLN("[ESP-NOW] Cannot send - not paired with receiver!");
+    return false;
+  }
+
   char msg[16];
   snprintf(msg, sizeof(msg), "AMB:%d", laneId);
   DBG("[ESP-NOW] TX: %s\n", msg);
 
   for (int r = 0; r < ESPNOW_RETRY_COUNT; r++) {
     espNowSendSuccess = false;
-    esp_err_t result = esp_now_send(RECEIVER_MAC, (uint8_t *)msg, strlen(msg));
+    esp_err_t result = esp_now_send(receiverMAC, (uint8_t *)msg, strlen(msg));
 
     if (result == ESP_OK) {
       delay(50); /* Brief wait for callback */
@@ -633,7 +617,7 @@ bool detectSiren(void) {
 }
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 12: TRAFFIC CYCLE SIMULATION + LCD DISPLAY             ║
+ * ║  SECTION 12: TRAFFIC CYCLE SIMULATION                           ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 void TrafficSim_Init(void) {
@@ -684,78 +668,6 @@ void TrafficSim_AmbulanceOverride(uint8_t laneId) {
       LANE_NAMES[laneId % 4], AMBULANCE_OVERRIDE_MS / 1000);
 }
 
-/*  LCD Display Modes:
- *    Normal:    N:10 E:-- S:-- W:--  |  Active: NORTH
- *    Ambulance: !! AMBULANCE !!      |  DIR:NORTH  14s
- *    Yellow:    N:03 E:-- S:-- W:--  |  YELLOW > NORTH    */
-
-void LCD_DisplayUpdate(void) {
-#if LCD_ENABLED == 0
-  return;
-#endif
-  if (!lcdInitialized)
-    return;
-  uint32_t now = millis();
-  if ((now - lastLcdUpdate) < LCD_REFRESH_MS)
-    return;
-  lastLcdUpdate = now;
-
-  uint32_t elapsed = now - tsimPhaseStartMs;
-  char row0[17], row1[17];
-
-  if (tsimPhase == TSIM_AMBULANCE) {
-    /* ---- AMBULANCE MODE ---- */
-    uint32_t remMs =
-        (elapsed < AMBULANCE_OVERRIDE_MS) ? AMBULANCE_OVERRIDE_MS - elapsed : 0;
-    uint32_t remSec = (remMs + 999) / 1000;
-    snprintf(row0, sizeof(row0), "!! AMBULANCE !!");
-    snprintf(row1, sizeof(row1), "DIR:%-5s  %2lus",
-             LANE_NAMES[tsimAmbulanceLane], (unsigned long)remSec);
-  } else {
-    /* ---- NORMAL / YELLOW / ALL_RED ---- */
-    uint32_t dur = 0;
-    switch (tsimPhase) {
-    case TSIM_GREEN:
-      dur = GREEN_DURATION_MS;
-      break;
-    case TSIM_YELLOW:
-      dur = YELLOW_DURATION_MS;
-      break;
-    case TSIM_ALL_RED:
-      dur = ALL_RED_GAP_MS;
-      break;
-    default:
-      break;
-    }
-    uint32_t remMs = (elapsed < dur) ? dur - elapsed : 0;
-    uint32_t remSec = (remMs + 999) / 1000;
-    if (remSec > 99)
-      remSec = 99;
-
-    char ls[4][4];
-    for (int i = 0; i < 4; i++) {
-      if (i == tsimActiveLane && tsimPhase != TSIM_ALL_RED)
-        snprintf(ls[i], sizeof(ls[i]), "%2lu", (unsigned long)remSec);
-      else
-        strcpy(ls[i], "--");
-    }
-    snprintf(row0, sizeof(row0), "N:%sE:%sS:%sW:%s", ls[0], ls[1], ls[2],
-             ls[3]);
-
-    if (tsimPhase == TSIM_GREEN)
-      snprintf(row1, sizeof(row1), "Active: %-7s", LANE_NAMES[tsimActiveLane]);
-    else if (tsimPhase == TSIM_YELLOW)
-      snprintf(row1, sizeof(row1), "YELLOW > %-6s", LANE_NAMES[tsimActiveLane]);
-    else
-      snprintf(row1, sizeof(row1), "ALL RED  WAIT  ");
-  }
-
-  LCD_SetCursor(0, 0);
-  LCD_PrintPadded(row0);
-  LCD_SetCursor(1, 0);
-  LCD_PrintPadded(row1);
-}
-
 /* ╔═══════════════════════════════════════════════════════════════════╗
  * ║  SECTION 13: DETECTION PIPELINE                                 ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
@@ -768,14 +680,6 @@ void runDetectionPipeline(const char *source) {
     soundTriggers++;
   else
     mlTriggers++;
-
-  /* Show on LCD */
-  if (lcdInitialized) {
-    LCD_SetCursor(0, 0);
-    LCD_PrintPadded("DETECTING...");
-    LCD_SetCursor(1, 0);
-    LCD_PrintPadded("Camera+AI check");
-  }
 
   /* Step 1: Capture */
   DBGLN("[1/3] Capturing camera frame...");
@@ -818,8 +722,11 @@ void setup() {
   delay(1000);
 
   DBGLN("\n================================================");
-  DBGLN("  ESP32-CAM Sender v4.0 — ESP-NOW Architecture");
+  DBGLN("  ESP32-CAM Sender v5.0 — ESP-NOW Architecture");
   DBGLN("  Camera + Roboflow + Sound + ESP-NOW TX");
+  DBGLN("  Sender MAC:   A8:42:E3:56:83:2C");
+  DBGLN("  Receiver MAC: FC:E8:C0:7A:B7:A0");
+  DBGLN("  WiFi: Vivo_V29_5G");
   DBGLN("================================================");
   DBG("  Lane: %d | Trigger: %d", MONITORED_LANE_ID, TRIGGER_MODE);
 #if TRIGGER_MODE == 0
@@ -858,19 +765,11 @@ void setup() {
   /* Camera */
   cameraInitialized = initCamera();
 
-  /* ESP-NOW (replaces LoRa) */
+  /* ESP-NOW sender (auto-pairing — replaces manual MAC) */
   espNowInitialized = initEspNow();
-
-  /* LCD (AFTER camera — shares I2C pins) */
-#if LCD_ENABLED
-  lcdInitialized = LCD_Init();
-  if (lcdInitialized) {
-    LCD_SetCursor(0, 0);
-    LCD_PrintPadded("Traffic Monitor");
-    LCD_SetCursor(1, 0);
-    LCD_PrintPadded("Booting...");
+  if (espNowInitialized) {
+    autoDiscoverReceiver();
   }
-#endif
 
   /* Traffic simulation */
   TrafficSim_Init();
@@ -880,25 +779,14 @@ void setup() {
   DBG("  WiFi:     %s\n", wifiConnected ? "OK" : "FAIL");
   DBG("  Camera:   %s\n", cameraInitialized ? "OK" : "FAIL");
   DBG("  ESP-NOW:  %s\n", espNowInitialized ? "OK" : "FAIL");
-  DBG("  LCD:      %s\n", lcdInitialized ? "OK" : "OFF/FAIL");
+  DBG("  Paired:   %s\n", receiverPaired ? "YES" : "NO");
+  DBGLN("  LCD:      On STM32 (not this board)");
 #if TRIGGER_MODE == 0 || TRIGGER_MODE == 2
   if (wifiConnected)
     DBG("  Trigger: http://%s/trigger\n", WiFi.localIP().toString().c_str());
 #endif
   DBGLN("-------------------------------\n");
   DBGLN("[Ready] Monitoring...");
-
-  /* LCD ready screen */
-  if (lcdInitialized) {
-    LCD_SetCursor(0, 0);
-    LCD_PrintPadded("System Ready!");
-    char line[17];
-    snprintf(line, sizeof(line), "Lane:%s WiFi:%s",
-             LANE_NAMES[MONITORED_LANE_ID], wifiConnected ? "OK" : "NO");
-    LCD_SetCursor(1, 0);
-    LCD_PrintPadded(line);
-    delay(2000);
-  }
 }
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
@@ -914,9 +802,8 @@ void loop() {
     httpServer.handleClient();
 #endif
 
-  /* Always update traffic simulation & LCD */
+  /* Update traffic simulation */
   TrafficSim_Update();
-  LCD_DisplayUpdate();
 
   /* Cooldown check */
   if (inCooldown) {

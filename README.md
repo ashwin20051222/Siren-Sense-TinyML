@@ -2,7 +2,7 @@
 
 > **Detailed setup & training instructions →** [INSTRUCTIONS.md](INSTRUCTIONS.md) | **Wiring →** [WIRING.md](WIRING.md)
 
-A two-stage emergency vehicle detection system combining **ML audio detection** (laptop) with **visual verification** (ESP32-CAM + Roboflow) and **ESP-NOW WiFi alerting** (receiver ESP32 → STM32 traffic controller).
+A two-stage emergency vehicle detection system combining **ML audio detection** (laptop) with **visual verification** (ESP32-CAM + Roboflow) and **ESP-NOW WiFi alerting** (receiver ESP32 → STM32 traffic controller). Both ESP32s are paired via **MAC address** (Sender: `A8:42:E3:56:83:2C`, Receiver: `FC:E8:C0:7A:B7:A0`). The 16×2 LCD display is connected to the **STM32F103RB** only.
 
 ---
 
@@ -16,6 +16,7 @@ A two-stage emergency vehicle detection system combining **ML audio detection** 
                   │ emergency / non_emergency│       │ Sound Sensor (local fallback)   │
                   └──────────────────────────┘       └──────────┬─────────────────────┘
                                                                 │ ESP-NOW WiFi (~200m)
+                                                                │ (auto-paired via beacon)
                                                                 ▼
                                                     ┌──────────────────────────┐
                                                     │ ESP32 DevKit (Receiver)  │
@@ -24,6 +25,7 @@ A two-stage emergency vehicle detection system combining **ML audio detection** 
                                                                │ UART Wire
                                                                ▼
                                                     🚦 STM32 Traffic Controller
+                                                       + 16×2 LCD (PC6/PC7)
 ```
 
 **Fallback**: If the laptop is offline, the ESP32-CAM's on-board sound sensor (GPIO 33) provides basic siren detection locally.
@@ -42,8 +44,9 @@ A two-stage emergency vehicle detection system combining **ML audio detection** 
 | `src/record_data.py` | Record audio samples from microphone |
 | `src/prepare_dataset.py` | Dataset preparation utilities |
 | `src/download_extra_data.py` | Download additional training data |
-| `esp32_firmware/esp32_cam_sender/` | **ESP32-CAM sender firmware** (camera + Roboflow + ESP-NOW TX + LCD) |
+| `esp32_firmware/esp32_cam_sender/` | **ESP32-CAM sender firmware** (camera + Roboflow + ESP-NOW TX) |
 | `esp32_firmware/stm32_esp32_receiver/` | **Receiver ESP32 firmware** (ESP-NOW RX → UART → STM32) |
+| `esp32_firmware/find_mac_address/` | **MAC address finder** utility (flash to any ESP32 to get its MAC) |
 | `stm32_firmware/` | **STM32 traffic controller** (bare-metal C, traffic FSM + LCD) |
 | `WIRING.md` | Complete wiring guide for all components |
 | `requirements_pc.txt` | PC/laptop dependencies |
@@ -69,9 +72,16 @@ python3 src/inference_pi.py --threshold 0.8
 
 ### 3. Integrated Mode: Laptop ML → ESP32-CAM → Roboflow → ESP-NOW → STM32
 
-**a) Flash Receiver ESP32** — Edit WiFi credentials in `stm32_esp32_receiver.ino`, flash with Arduino IDE (Board: ESP32 Dev Module). Note the **MAC address** from Serial Monitor.
+**a) Find MAC Addresses** — Flash `esp32_firmware/find_mac_address/find_mac_address.ino` to each ESP32 board. Open Serial Monitor at 115200 baud to see the MAC address.
 
-**b) Flash ESP32-CAM** — Edit WiFi/Roboflow credentials and set `RECEIVER_MAC` (from step a) in `esp32_cam_sender.ino`, flash (Board: AI Thinker ESP32-CAM). Note the IP address.
+| Board | MAC Address |
+|-------|-------------|
+| ESP32-CAM (Sender) | `A8:42:E3:56:83:2C` |
+| ESP32 DevKit (Receiver) | `FC:E8:C0:7A:B7:A0` |
+
+**b) Flash Receiver ESP32** — WiFi credentials are pre-configured (`Vivo_V29_5G`), flash `stm32_esp32_receiver.ino` with Arduino IDE (Board: ESP32 Dev Module).
+
+**c) Flash ESP32-CAM** — WiFi/Roboflow credentials pre-configured, flash `esp32_cam_sender.ino` (Board: AI Thinker ESP32-CAM). Note the IP address.
 
 **c) Wire Receiver ESP32 → STM32** — Connect ESP32 GPIO 17 (TX2) → STM32 PB11 (USART3 RX) + common GND.
 
@@ -93,7 +103,7 @@ When the ML detects a siren → triggers ESP32-CAM → camera captures image →
 | ESP32 DevKit (any) | 1 | ESP-NOW RX → UART bridge to STM32 |
 | STM32 NUCLEO-F103RB | 1 | Traffic light controller |
 | Sound sensor (analog) | 1 | Local fallback siren detection |
-| 16×2 I2C LCD (PCF8574) | 1–3 | Status display (optional, each board) |
+| 16×2 I2C LCD (PCF8574) | 1 | Status display (on STM32 only, PC6/PC7) |
 | FTDI USB-UART adapter | 1 | For flashing ESP32-CAM |
 | USB microphone (laptop) | 1 | Primary audio input for ML |
 
@@ -106,23 +116,32 @@ When the ML detects a siren → triggers ESP32-CAM → camera captures image →
 ### ESP32-CAM Sender (`esp32_cam_sender.ino` Section 1)
 
 ```cpp
-#define WIFI_SSID           "YourWiFi"
-#define WIFI_PASSWORD       "YourPassword"
+#define WIFI_SSID           "Vivo_V29_5G"
+#define WIFI_PASSWORD       "123456789"
 #define ROBOFLOW_API_URL    "https://detect.roboflow.com/YOUR_PROJECT/YOUR_VERSION"
-#define ROBOFLOW_API_KEY    "YOUR_API_KEY"
+#define ROBOFLOW_API_KEY    "YOUR_ROBOFLOW_API_KEY"
 #define ROBOFLOW_TARGET_CLASS "ambulance"
 #define MONITORED_LANE_ID   0           // 0=North, 1=East, 2=South, 3=West
-static uint8_t RECEIVER_MAC[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}; // Receiver's MAC
-#define LCD_ENABLED         1           // 0=no LCD, 1=LCD connected
+// Sender MAC:   A8:42:E3:56:83:2C
+// Receiver MAC: FC:E8:C0:7A:B7:A0 (hardcoded fallback + auto-pair)
 ```
 
 ### Receiver ESP32 (`stm32_esp32_receiver.ino` Section 1)
 
 ```cpp
-#define WIFI_SSID           "YourWiFi"      // SAME as sender!
-#define WIFI_PASSWORD       "YourPassword"
-#define STM32_TX_PIN        17              // UART TX to STM32
-#define LCD_ENABLED         1               // 0=no LCD
+#define WIFI_SSID           "Vivo_V29_5G"    // SAME as sender!
+#define WIFI_PASSWORD       "123456789"
+#define STM32_TX_PIN        17               // UART TX to STM32
+// Receiver MAC: FC:E8:C0:7A:B7:A0
+// Known Sender: A8:42:E3:56:83:2C
+```
+
+### MAC Address Finder (`find_mac_address.ino`)
+
+Flash this utility to any ESP32 to discover its MAC address:
+```cpp
+// Uses esp_read_mac() from <esp_mac.h> — no WiFi needed!
+// Open Serial Monitor at 115200 baud after flashing.
 ```
 
 ### ESP32-CAM HTTP Endpoints
@@ -146,7 +165,7 @@ static uint8_t RECEIVER_MAC[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}; // Receive
 5. ESP32-CAM captures JPEG frame (640×480)
 6. Base64-encoded image POSTed to Roboflow API
 7. If "ambulance" class detected (≥60% confidence):
-   └─► ESP-NOW sends "AMB:<lane_id>" to receiver ESP32
+   └─► ESP-NOW sends "AMB:<lane_id>" to receiver ESP32 (auto-paired)
 8. Receiver forwards "AMB:<lane_id>" via UART to STM32
 9. STM32 traffic controller gives priority to that lane
 10. 60-second cooldown before next detection
@@ -184,12 +203,13 @@ static uint8_t RECEIVER_MAC[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}; // Receive
 
 | Problem | Solution |
 |---------|----------|
-| ESP32-CAM not reachable via WiFi | Check SSID/password, ensure laptop and ESP32 on same network |
+| ESP32-CAM not reachable via WiFi | Check SSID/password (`Vivo_V29_5G`), ensure laptop and ESP32 on same network |
 | Roboflow API returns error | Verify API key and project URL in sender `.ino` |
-| ESP-NOW send fails | Ensure both ESP32s on same WiFi network, check receiver MAC |
-| Receiver not getting messages | Verify MAC address in sender matches receiver's actual MAC |
-| STM32 not responding | Check UART wiring (ESP32 GPIO 17 → STM32 **PB11**) + common GND |
-| ML too sensitive / not sensitive | Adjust `--threshold` and `--consecutive` |
+| ESP-NOW send fails | Ensure both ESP32s on same WiFi network (`Vivo_V29_5G`). Check Serial Monitor for pairing status |
+| Receiver not getting messages | Both must be powered on — receiver broadcasts beacon, sender discovers it automatically. If auto-pair fails, hardcoded MAC (FC:E8:C0:7A:B7:A0) is used as fallback |
+| Pairing timeout | Ensure both ESP32s are on and connected to same WiFi within 30 seconds of each other. Sender falls back to hardcoded receiver MAC after timeout |
+| Need to find MAC address | Flash `esp32_firmware/find_mac_address/find_mac_address.ino` to the board, open Serial Monitor at 115200 |
+| LCD blank / not working | LCD is on STM32 only (PC6/PC7). Try I2C address 0x3F, check wiring + 5V power |
 | Audio device not found | Run `--list-devices` to see available inputs |
 | `/dev/ttyUSB0` permission denied | `sudo usermod -aG dialout $USER` then re-login |
 

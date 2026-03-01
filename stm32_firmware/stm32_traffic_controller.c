@@ -24,8 +24,9 @@
  *    Traffic LEDs: PA0,PA1,PA8 (N) | PA9,PA10,PA11 (E) |
  *                  PB13,PB14,PB15 (S) | PC8,PC9,PC10 (W)
  *    Ped Buttons:  PB5(N), PB6(E), PB7(S), PB8(W)
- *    Ped LEDs:     PB9/PB4 (N R/G) | PB3/PB12 (E R/G) |
+ *    Ped LEDs:     PB9/PB4 (N R/G) | PC2/PB12 (E R/G) |
  *                  PC0/PC1 (S R/G) | PC4/PC5 (W R/G)
+ *    IR Sensors:   PC11(N), PC12(E), PD2(S), PA12(W) — GPIO_Input Pull-Up
  *    ESP32 UART:   PB10(TX3), PB11(RX3) — USART3 @ 115200
  *    Debug UART:   PA2(TX2), PA3(RX2) — USART2 @ 115200
  *    LCD I2C:      PC6(SDA), PC7(SCL) — bit-banged
@@ -93,6 +94,16 @@ typedef struct {
 #define RCC_APB2ENR_IOPCEN (1U << 4)
 #define RCC_APB2ENR_IOPDEN (1U << 5)
 #define RCC_APB2ENR_AFIOEN (1U << 0)
+
+/* IR Sensor pins (Input Pull-Up, active-low) */
+#define IR_NORTH_PORT GPIOC
+#define IR_NORTH_PIN 11
+#define IR_EAST_PORT GPIOC
+#define IR_EAST_PIN 12
+#define IR_SOUTH_PORT GPIOD
+#define IR_SOUTH_PIN 2
+#define IR_WEST_PORT GPIOA
+#define IR_WEST_PIN 12
 #define RCC_APB1ENR_USART2EN (1U << 17)
 #define RCC_APB1ENR_USART3EN (1U << 18)
 
@@ -114,7 +125,8 @@ typedef struct {
 #define ALL_RED_GAP_MS 1000
 #define PED_WALK_TIME_MS 7000
 #define PED_FLASH_TIME_MS 3000
-#define EMERGENCY_CLEAR_MS 2000  /* time to clear current lane before override \
+#define EMERGENCY_CLEAR_MS                                                     \
+  2000                           /* time to clear current lane before override \
                                   */
 #define EMERGENCY_GREEN_MS 15000 /* emergency lane green duration */
 
@@ -255,7 +267,7 @@ static void GPIO_Init(void) {
   RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_IOPCEN |
                   RCC_APB2ENR_IOPDEN | RCC_APB2ENR_AFIOEN;
 
-  /* Disable JTAG to free PB3, PB4 (keep SWD) */
+  /* Disable JTAG to free PB4 (keep SWD) — PB3 is no longer used */
   AFIO->MAPR =
       (AFIO->MAPR & ~(7UL << 24)) | (2UL << 24); /* SWJ-DP without JTAG */
 
@@ -282,8 +294,8 @@ static void GPIO_Init(void) {
   /* North Ped: PB9(R), PB4(G) */
   gpio_set_mode(GPIOB, 9, 0x02);
   gpio_set_mode(GPIOB, 4, 0x02);
-  /* East Ped: PB3(R), PB12(G) */
-  gpio_set_mode(GPIOB, 3, 0x02);
+  /* East Ped: PC2(R), PB12(G) */
+  gpio_set_mode(GPIOC, 2, 0x02);
   gpio_set_mode(GPIOB, 12, 0x02);
   /* South Ped: PC0(R), PC1(G) */
   gpio_set_mode(GPIOC, 0, 0x02);
@@ -304,11 +316,39 @@ static void GPIO_Init(void) {
   /* --- User LED PC13 (Push-Pull Output, inverted on NUCLEO) --- */
   gpio_set_mode(GPIOC, 13, 0x02);
 
+  /* --- IR Sensors (Input Pull-Up, active-low) --- */
+  /* PC11(N), PC12(E), PD2(S), PA12(W) */
+  gpio_set_mode(IR_NORTH_PORT, IR_NORTH_PIN, 0x08);
+  gpio_set_mode(IR_EAST_PORT, IR_EAST_PIN, 0x08);
+  gpio_set_mode(IR_SOUTH_PORT, IR_SOUTH_PIN, 0x08);
+  gpio_set_mode(IR_WEST_PORT, IR_WEST_PIN, 0x08);
+  /* Enable pull-ups for all IR sensor pins */
+  IR_NORTH_PORT->ODR |= (1U << IR_NORTH_PIN);
+  IR_EAST_PORT->ODR |= (1U << IR_EAST_PIN);
+  IR_SOUTH_PORT->ODR |= (1U << IR_SOUTH_PIN);
+  IR_WEST_PORT->ODR |= (1U << IR_WEST_PIN);
+
   /* --- LCD I2C: PC6(SDA), PC7(SCL) — Open-Drain Output for bit-bang --- */
   gpio_set_mode(GPIOC, 6, 0x06); /* Output 2MHz, Open-Drain */
   gpio_set_mode(GPIOC, 7, 0x06);
   gpio_write(GPIOC, 6, 1); /* Idle high */
   gpio_write(GPIOC, 7, 1);
+}
+
+/* Read IR sensor — returns 1 if vehicle detected (active-low: 0 = triggered) */
+static uint8_t ir_read(uint8_t lane) {
+  switch (lane) {
+  case LANE_NORTH:
+    return !gpio_read(IR_NORTH_PORT, IR_NORTH_PIN);
+  case LANE_EAST:
+    return !gpio_read(IR_EAST_PORT, IR_EAST_PIN);
+  case LANE_SOUTH:
+    return !gpio_read(IR_SOUTH_PORT, IR_SOUTH_PIN);
+  case LANE_WEST:
+    return !gpio_read(IR_WEST_PORT, IR_WEST_PIN);
+  default:
+    return 0;
+  }
 }
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
@@ -557,7 +597,7 @@ static const TrafficLight_t TL[NUM_LANES] = {
 
 static const PedestrianLight_t PL[NUM_LANES] = {
     {GPIOB, 9, GPIOB, 4, GPIOB, 5},  /* North: PB9(R), PB4(G), PB5(Btn) */
-    {GPIOB, 3, GPIOB, 12, GPIOB, 6}, /* East:  PB3(R), PB12(G), PB6(Btn) */
+    {GPIOC, 2, GPIOB, 12, GPIOB, 6}, /* East:  PC2(R), PB12(G), PB6(Btn) */
     {GPIOC, 0, GPIOC, 1, GPIOB, 7},  /* South: PC0(R), PC1(G), PB7(Btn) */
     {GPIOC, 4, GPIOC, 5, GPIOB, 8},  /* West:  PC4(R), PC5(G), PB8(Btn) */
 };
@@ -880,7 +920,7 @@ static void lcd_update(void) {
         if (remSec >= 10)
           row0[len++] = '0' + (remSec / 10);
         else
-          row0[len++] = '0' + (remSec / 10);
+          row0[len++] = ' ';
         row0[len++] = '0' + (remSec % 10);
       } else {
         row0[len++] = '-';

@@ -8,24 +8,37 @@
  *    ESP32-CAM (sender) ─── ESP-NOW WiFi ───► THIS ESP32 ─── UART ───► STM32
  *
  *  WHAT THIS DOES:
- *    1. Receives "AMB:<lane_id>" messages from ESP32-CAM via ESP-NOW
- *    2. Forwards them to STM32 via UART (Serial2, GPIO 17 TX)
- *    3. Blinks LED and shows status on optional LCD
+ *    1. Broadcasts "PAIR:RCV" beacon until sender auto-discovers this board
+ *    2. Receives "AMB:<lane_id>" messages from ESP32-CAM via ESP-NOW
+ *    3. Forwards them to STM32 via UART (Serial2, GPIO 17 TX)
+ *    4. Blinks LED on alert receipt
+ *
+ *  MAC ADDRESSES:
+ *    This board (Receiver): FC:E8:C0:7A:B7:A0
+ *    Sender (ESP32-CAM):    A8:42:E3:56:83:2C
+ *    Use esp32_firmware/find_mac_address/ sketch to find your board's MAC.
+ *
+ *  AUTO-PAIRING:
+ *    On boot, this receiver broadcasts a "PAIR:RCV" beacon every 2 seconds.
+ *    The sender (A8:42:E3:56:83:2C) auto-discovers this board, adds it as a
+ *    peer, and sends "PAIR:ACK" to confirm. LED blinks fast during pairing,
+ *    then shows brief solid to confirm paired.
  *
  *  LIBRARIES:
- *    - ArduinoJson by Benoit Blanchon (v6.x or v7.x) — for status endpoint
  *    - ESP32 Board Package (esp32 by Espressif, v2.x+)
  *
- *  WIRING:
- *    ESP32 GPIO 17 (TX2) ──► STM32 USART RX (e.g. PA3 for USART2)
- *    ESP32 GPIO 16 (RX2) ──► STM32 USART TX (e.g. PA2 for USART2) [optional]
+ *  WIRING (only 3 wires!):
+ *    ESP32 GPIO 17 (TX2) ──► STM32 PB11 (USART3 RX)
+ *    ESP32 GPIO 16 (RX2) ──► STM32 PB10 (USART3 TX) [optional]
  *    ESP32 GND            ──► STM32 GND (MUST be common ground!)
  *    ESP32 5V             ──► USB power
+ *
+ *  WiFi: Vivo_V29_5G (2.4 GHz) — both boards must be on the SAME network.
+ *  NOTE: LCD display is connected to the STM32 (PC6/PC7), NOT this ESP32.
  * ============================================================================
  */
 
 #include <WiFi.h>
-#include <Wire.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 
@@ -36,25 +49,25 @@
 /* ---- WiFi (2.4 GHz only) ----
  *  Must be on the SAME network/channel as ESP32-CAM sender
  *  for ESP-NOW to work reliably */
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID "Vivo_V29_5G"
+#define WIFI_PASSWORD "123456789"
 
 /* ---- UART to STM32 ---- */
 #define STM32_UART_BAUD 115200
-#define STM32_TX_PIN 17 /* ESP32 TX2 → STM32 USART RX */
-#define STM32_RX_PIN 16 /* ESP32 RX2 ← STM32 USART TX (optional) */
+#define STM32_TX_PIN 17 /* ESP32 TX2 → STM32 PB11 (USART3 RX) */
+#define STM32_RX_PIN 16 /* ESP32 RX2 ← STM32 PB10 (USART3 TX) [optional] */
 
 /* ---- Status LED ---- */
 #define LED_PIN 2 /* Built-in LED on most ESP32 DevKits */
 #define LED_BLINK_MS 500
 
-/* ---- LCD Display (16×2 I2C, PCF8574 backpack) ----
- *  Set LCD_ENABLED to 0 if no LCD connected */
-#define LCD_ENABLED 1
-#define LCD_I2C_ADDR 0x27
-#define LCD_SDA_PIN 21 /* Default I2C SDA on ESP32 DevKit */
-#define LCD_SCL_PIN 22 /* Default I2C SCL on ESP32 DevKit */
-#define LCD_REFRESH_MS 500
+/* ---- Auto-Pairing ---- */
+#define PAIR_BEACON_INTERVAL_MS 2000 /* Broadcast beacon every 2 seconds */
+#define PAIR_BEACON_MSG "PAIR:RCV"   /* Beacon message sent to broadcast */
+#define PAIR_ACK_MSG "PAIR:ACK"      /* ACK message from sender */
+
+/* ---- Known Sender MAC (ESP32-CAM: A8:42:E3:56:83:2C) ---- */
+static const uint8_t KNOWN_SENDER_MAC[] = {0xA8, 0x42, 0xE3, 0x56, 0x83, 0x2C};
 
 /* ---- Debug ---- */
 #define SERIAL_BAUD_RATE 115200
@@ -69,121 +82,18 @@
 #endif
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 2: LCD I2C DRIVER (self-contained, no library needed)  ║
- * ╚═══════════════════════════════════════════════════════════════════╝ */
-
-/* PCF8574 backpack bits */
-#define LCD_BL_BIT 0x08
-#define LCD_EN_BIT 0x04
-#define LCD_RW_BIT 0x02
-#define LCD_RS_BIT 0x01
-
-/* HD44780 commands */
-#define LCD_CMD_CLEAR 0x01
-#define LCD_CMD_HOME 0x02
-#define LCD_CMD_ENTRY_MODE 0x06
-#define LCD_CMD_DISPLAY_ON 0x0C
-#define LCD_CMD_FUNC_4BIT 0x28
-#define LCD_CMD_SET_DDRAM 0x80
-#define LCD_LINE0_ADDR 0x00
-#define LCD_LINE1_ADDR 0x40
-
-static bool lcdReady = false;
-
-static void lcd_i2c_write(uint8_t data) {
-  Wire.beginTransmission(LCD_I2C_ADDR);
-  Wire.write(data);
-  Wire.endTransmission();
-}
-
-static void lcd_pulse_enable(uint8_t data) {
-  lcd_i2c_write(data | LCD_EN_BIT);
-  delayMicroseconds(1);
-  lcd_i2c_write(data & ~LCD_EN_BIT);
-  delayMicroseconds(50);
-}
-
-static void lcd_send_nibble(uint8_t nibble, uint8_t mode) {
-  lcd_pulse_enable((nibble & 0xF0) | mode | LCD_BL_BIT);
-}
-
-static void lcd_send_byte(uint8_t value, uint8_t mode) {
-  lcd_send_nibble(value & 0xF0, mode);
-  lcd_send_nibble((value << 4) & 0xF0, mode);
-}
-
-static void lcd_command(uint8_t cmd) {
-  lcd_send_byte(cmd, 0);
-  if (cmd <= 0x02)
-    delay(2);
-}
-
-static void lcd_data(uint8_t ch) { lcd_send_byte(ch, LCD_RS_BIT); }
-
-static bool LCD_Init(void) {
-#if LCD_ENABLED == 0
-  return false;
-#endif
-  Wire.begin(LCD_SDA_PIN, LCD_SCL_PIN, 100000);
-  delay(50);
-  lcd_send_nibble(0x30, 0);
-  delay(5);
-  lcd_send_nibble(0x30, 0);
-  delay(5);
-  lcd_send_nibble(0x30, 0);
-  delay(1);
-  lcd_send_nibble(0x20, 0);
-  delay(1);
-  lcd_command(LCD_CMD_FUNC_4BIT);
-  lcd_command(LCD_CMD_DISPLAY_ON);
-  lcd_command(LCD_CMD_CLEAR);
-  lcd_command(LCD_CMD_ENTRY_MODE);
-  lcdReady = true;
-  return true;
-}
-
-static void LCD_Clear(void) {
-  if (lcdReady)
-    lcd_command(LCD_CMD_CLEAR);
-}
-
-static void LCD_SetCursor(uint8_t row, uint8_t col) {
-  if (!lcdReady)
-    return;
-  lcd_command(LCD_CMD_SET_DDRAM |
-              ((row ? LCD_LINE1_ADDR : LCD_LINE0_ADDR) + col));
-}
-
-static void LCD_Print(const char *str) {
-  if (!lcdReady || !str)
-    return;
-  for (uint8_t i = 0; *str && i < 16; i++)
-    lcd_data((uint8_t)*str++);
-}
-
-static void LCD_PrintPadded(const char *str) {
-  if (!lcdReady || !str)
-    return;
-  uint8_t i = 0;
-  while (*str && i < 16) {
-    lcd_data((uint8_t)*str++);
-    i++;
-  }
-  while (i < 16) {
-    lcd_data(' ');
-    i++;
-  }
-}
-
-/* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 3: GLOBAL STATE                                        ║
+ * ║  SECTION 2: GLOBAL STATE                                        ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 static const char *LANE_NAMES[] = {"NORTH", "EAST", "SOUTH", "WEST"};
 
 static bool wifiConnected = false;
 static bool espNowInitialized = false;
-static bool lcdInitialized = false;
+
+/* Auto-pairing state */
+static bool paired = false;
+static uint8_t senderMAC[6] = {0};
+static uint32_t lastBeaconTime = 0;
 
 /* Received message state */
 static volatile bool newMessageReceived = false;
@@ -196,11 +106,8 @@ static uint32_t lastReceiveTime = 0;
 static uint32_t ledOffTime = 0;
 static bool ledOn = false;
 
-/* LCD update */
-static uint32_t lastLcdUpdate = 0;
-
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 4: WiFi                                                ║
+ * ║  SECTION 3: WiFi                                                ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 bool connectWiFi(void) {
@@ -223,17 +130,36 @@ bool connectWiFi(void) {
 }
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 5: ESP-NOW RECEIVER                                   ║
+ * ║  SECTION 4: ESP-NOW AUTO-PAIRING + RECEIVER                    ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
-/* ESP-NOW receive callback — called from WiFi task context */
+/* ESP-NOW receive callback — handles both pairing ACK and ambulance messages */
 void onEspNowReceive(const uint8_t *mac_addr, const uint8_t *data, int len) {
   if (len <= 0 || len >= (int)sizeof(lastReceivedMsg))
     return;
 
-  /* Copy message */
-  memcpy(lastReceivedMsg, data, len);
-  lastReceivedMsg[len] = '\0';
+  /* Temporary buffer to check message */
+  char msg[32];
+  memcpy(msg, data, len);
+  msg[len] = '\0';
+
+  /* Check for PAIR:ACK from sender */
+  if (!paired && strcmp(msg, PAIR_ACK_MSG) == 0) {
+    paired = true;
+    memcpy(senderMAC, mac_addr, 6);
+    DBG("\n[PAIR] ✅ PAIRED with sender: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4],
+        mac_addr[5]);
+
+    /* Brief LED solid on to confirm pairing */
+    digitalWrite(LED_PIN, HIGH);
+    delay(500);
+    digitalWrite(LED_PIN, LOW);
+    return;
+  }
+
+  /* Normal message (e.g., AMB:0) */
+  memcpy(lastReceivedMsg, msg, len + 1);
   memcpy(lastSenderMAC, mac_addr, 6);
   newMessageReceived = true;
   totalMessagesReceived++;
@@ -251,12 +177,31 @@ bool initEspNow(void) {
 
   esp_now_register_recv_cb(onEspNowReceive);
 
-  DBGLN("[ESP-NOW] Receiver initialized, waiting for messages...");
+  /* Add broadcast peer for pairing beacons */
+  esp_now_peer_info_t bcastPeer = {};
+  memset(bcastPeer.peer_addr, 0xFF, 6); /* FF:FF:FF:FF:FF:FF = broadcast */
+  bcastPeer.channel = 0;
+  bcastPeer.encrypt = false;
+  esp_now_add_peer(&bcastPeer);
+
+  DBGLN("[ESP-NOW] Receiver initialized with auto-pairing.");
   return true;
 }
 
+/* Send pairing beacon via broadcast */
+void sendPairingBeacon(void) {
+  uint32_t now = millis();
+  if ((now - lastBeaconTime) < PAIR_BEACON_INTERVAL_MS)
+    return;
+  lastBeaconTime = now;
+
+  uint8_t bcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  esp_now_send(bcast, (uint8_t *)PAIR_BEACON_MSG, strlen(PAIR_BEACON_MSG));
+  DBG("[PAIR] Beacon sent: \"%s\" (waiting for sender...)\n", PAIR_BEACON_MSG);
+}
+
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 6: UART BRIDGE TO STM32                               ║
+ * ║  SECTION 5: UART BRIDGE TO STM32                               ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 void initSTM32UART(void) {
@@ -266,7 +211,6 @@ void initSTM32UART(void) {
 }
 
 void forwardToSTM32(const char *msg) {
-  /* Send message + newline to STM32 via UART */
   Serial2.println(msg);
   DBG("[UART] Forwarded to STM32: \"%s\"\n", msg);
 }
@@ -285,46 +229,7 @@ bool parseAmbulanceMessage(const char *msg, uint8_t *laneId) {
 }
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 7: LCD STATUS DISPLAY                                  ║
- * ╚═══════════════════════════════════════════════════════════════════╝ */
-
-void LCD_UpdateStatus(void) {
-#if LCD_ENABLED == 0
-  return;
-#endif
-  if (!lcdInitialized)
-    return;
-  uint32_t now = millis();
-  if ((now - lastLcdUpdate) < LCD_REFRESH_MS)
-    return;
-  lastLcdUpdate = now;
-
-  char row0[17], row1[17];
-
-  if (lastReceiveTime > 0 && (now - lastReceiveTime) < 15000) {
-    /* Recent alert — show ambulance info */
-    uint8_t laneId = 0;
-    parseAmbulanceMessage(lastReceivedMsg, &laneId);
-    uint32_t agoSec = (now - lastReceiveTime) / 1000;
-    snprintf(row0, sizeof(row0), "!! AMBULANCE !!");
-    snprintf(row1, sizeof(row1), "Lane:%-5s %2lus",
-             (laneId < 4) ? LANE_NAMES[laneId] : "???", (unsigned long)agoSec);
-  } else {
-    /* Idle — show uptime and message count */
-    uint32_t uptimeMin = now / 60000;
-    snprintf(row0, sizeof(row0), "Receiver Ready");
-    snprintf(row1, sizeof(row1), "Up:%lum Rx:%lu", (unsigned long)uptimeMin,
-             (unsigned long)totalMessagesReceived);
-  }
-
-  LCD_SetCursor(0, 0);
-  LCD_PrintPadded(row0);
-  LCD_SetCursor(1, 0);
-  LCD_PrintPadded(row1);
-}
-
-/* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 8: SETUP                                               ║
+ * ║  SECTION 6: SETUP                                               ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 void setup() {
@@ -332,8 +237,12 @@ void setup() {
   delay(1000);
 
   DBGLN("\n================================================");
-  DBGLN("  STM32-ESP32 Receiver v4.0 — ESP-NOW → UART");
-  DBGLN("  Receives from ESP32-CAM, forwards to STM32");
+  DBGLN("  STM32-ESP32 Receiver v7.0 — Auto-Pairing");
+  DBGLN("  ESP-NOW → UART Bridge");
+  DBGLN("  Receiver MAC: FC:E8:C0:7A:B7:A0");
+  DBGLN("  Known Sender: A8:42:E3:56:83:2C");
+  DBGLN("  WiFi: Vivo_V29_5G");
+  DBGLN("  LCD is on STM32 only (PC6/PC7 I2C)");
   DBGLN("================================================");
 
   /* LED */
@@ -343,45 +252,47 @@ void setup() {
   /* WiFi (STA mode — required for ESP-NOW) */
   wifiConnected = connectWiFi();
 
-  /* Print MAC address — MUST be copied to sender's RECEIVER_MAC */
-  DBGLN("\n┌─────────────────────────────────────────────┐");
-  DBG("│  THIS ESP32 MAC: %s  │\n", WiFi.macAddress().c_str());
-  DBGLN("│  ↑↑ Copy this to sender's RECEIVER_MAC! ↑↑  │");
-  DBGLN("└─────────────────────────────────────────────┘\n");
+  /* Print own MAC address for reference */
+  DBG("\n[Info] This ESP32 MAC: %s\n", WiFi.macAddress().c_str());
 
   /* UART to STM32 */
   initSTM32UART();
 
-  /* ESP-NOW receiver */
+  /* ESP-NOW receiver with auto-pairing */
   espNowInitialized = initEspNow();
-
-  /* LCD */
-#if LCD_ENABLED
-  lcdInitialized = LCD_Init();
-  if (lcdInitialized) {
-    LCD_SetCursor(0, 0);
-    LCD_PrintPadded("ESP32 Receiver");
-    LCD_SetCursor(1, 0);
-    LCD_PrintPadded("Waiting...");
-  }
-#endif
 
   /* Status report */
   DBGLN("\n-------- SYSTEM STATUS --------");
   DBG("  WiFi:     %s\n", wifiConnected ? "OK" : "FAIL");
   DBG("  ESP-NOW:  %s\n", espNowInitialized ? "OK" : "FAIL");
   DBG("  UART TX:  GPIO %d @ %d baud\n", STM32_TX_PIN, STM32_UART_BAUD);
-  DBG("  LCD:      %s\n", lcdInitialized ? "OK" : "OFF/FAIL");
+  DBGLN("  LCD:      On STM32 (not this board)");
+  DBGLN("  Pairing:  Broadcasting beacon...");
   DBGLN("-------------------------------\n");
-  DBGLN("[Ready] Waiting for ESP-NOW messages from ESP32-CAM...");
 }
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 9: MAIN LOOP                                          ║
+ * ║  SECTION 7: MAIN LOOP                                          ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 void loop() {
   uint32_t now = millis();
+
+  /* ---- AUTO-PAIRING: broadcast beacon until sender responds ---- */
+  if (!paired && espNowInitialized) {
+    sendPairingBeacon();
+
+    /* Fast-blink LED while waiting for pairing */
+    if ((now / 200) % 2)
+      digitalWrite(LED_PIN, HIGH);
+    else
+      digitalWrite(LED_PIN, LOW);
+
+    delay(10);
+    return; /* Don't process ambulance messages until paired */
+  }
+
+  /* ---- NORMAL OPERATION (paired) ---- */
 
   /* Process received ESP-NOW message */
   if (newMessageReceived) {
@@ -417,13 +328,10 @@ void loop() {
     ledOn = false;
   }
 
-  /* LCD update */
-  LCD_UpdateStatus();
-
   /* Also check if STM32 sends anything back (optional) */
   while (Serial2.available()) {
     char c = Serial2.read();
-    Serial.write(c); /* Echo STM32 messages to debug serial */
+    Serial.write(c);
   }
 
   delay(10);

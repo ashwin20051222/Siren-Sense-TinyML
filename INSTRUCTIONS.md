@@ -120,14 +120,29 @@ This section sets up the full pipeline: **Laptop ML → ESP32-CAM → Roboflow �
 
 | Component | Purpose |
 |-----------|---------|
-| ESP32-CAM (AI-Thinker) | Camera + WiFi + ESP-NOW TX (sender) |
-| ESP32 DevKit (any standard) | ESP-NOW RX + UART bridge to STM32 (receiver) |
+| ESP32-CAM (AI-Thinker) | Camera + WiFi + ESP-NOW TX (sender) — MAC: `A8:42:E3:56:83:2C` |
+| ESP32 DevKit (any standard) | ESP-NOW RX + UART bridge to STM32 (receiver) — MAC: `FC:E8:C0:7A:B7:A0` |
 | Sound sensor (analog) | Local fallback siren detection (on ESP32-CAM) |
-| 16×2 I2C LCD (PCF8574) | Status display (optional, on each board) |
+| 16×2 I2C LCD (PCF8574) | Status display (on STM32 only, PC6/PC7) |
 | FTDI USB-UART adapter | For flashing ESP32-CAM firmware |
 | USB microphone (laptop) | Primary audio input for ML |
 
-> **No LoRa modules needed!** ESP-NOW uses the built-in WiFi hardware.
+> **No LoRa modules needed!** ESP-NOW uses the built-in WiFi hardware. Both ESP32s **auto-pair** via beacon, with hardcoded MAC fallback.
+
+### 5.2a Find Your Board's MAC Address (Optional)
+
+If you have different ESP32 boards, flash the MAC finder utility first:
+
+1. Open `esp32_firmware/find_mac_address/find_mac_address.ino` in Arduino IDE
+2. Select your board (ESP32 Dev Module or AI Thinker ESP32-CAM)
+3. Upload and open Serial Monitor at 115200 baud
+4. The MAC address will be printed — copy it for firmware configuration
+
+Current known MAC addresses:
+| Board | MAC Address |
+|-------|-------------|
+| ESP32-CAM (Sender) | `A8:42:E3:56:83:2C` |
+| ESP32 DevKit (Receiver) | `FC:E8:C0:7A:B7:A0` |
 
 ### 5.2 Wiring
 
@@ -159,70 +174,57 @@ See [WIRING.md](WIRING.md) for complete wiring diagrams and pin maps.
 | RX | GPIO 1 (TX0) |
 | — | IO0 → GND (during flash) |
 
-**LCD 16×2 → ESP32-CAM (shared with camera I2C, uses Wire1):**
-
-| LCD | ESP32-CAM |
-|-----|-----------|
-| SDA | GPIO 26 |
-| SCL | GPIO 27 |
-| VCC | 5V |
-| GND | GND |
-
-**LCD 16×2 → Receiver ESP32 (optional):**
-
-| LCD | ESP32 |
-|-----|-------|
-| SDA | GPIO 21 |
-| SCL | GPIO 22 |
-| VCC | 5V |
-| GND | GND |
+> **Note:** No LCD is connected to the ESP32s. The 16×2 LCD display is on the STM32F103RB only (PC6/PC7 bit-banged I2C).
 
 ### 5.3 Flash Receiver ESP32 (Do This First!)
 
 1. Open `esp32_firmware/stm32_esp32_receiver/stm32_esp32_receiver.ino` in Arduino IDE
-2. Edit Section 1 — set WiFi credentials:
+2. WiFi credentials are pre-configured:
    ```cpp
-   #define WIFI_SSID     "YourWiFiName"
-   #define WIFI_PASSWORD "YourWiFiPassword"
+   #define WIFI_SSID     "Vivo_V29_5G"
+   #define WIFI_PASSWORD "123456789"
    ```
+   Edit these if your WiFi network is different.
 3. Board Settings:
    - Board: **ESP32 Dev Module** (or your specific DevKit)
    - Upload Speed: 115200
 4. Upload and open Serial Monitor at 115200 baud
-5. **Copy the MAC address** — you'll see:
+5. You'll see the receiver broadcasting auto-pairing beacons:
    ```
-   ┌─────────────────────────────────────────────┐
-   │  THIS ESP32 MAC: AA:BB:CC:DD:EE:FF          │
-   │  ↑↑ Copy this to sender's RECEIVER_MAC! ↑↑  │
-   └─────────────────────────────────────────────┘
+   [Info] This ESP32 MAC: FC:E8:C0:7A:B7:A0
+   [PAIR] Beacon sent: "PAIR:RCV" (waiting for sender...)
    ```
+   LED blinks fast while waiting for sender to connect.
 
 ### 5.4 Flash ESP32-CAM (Sender)
 
 1. Open `esp32_firmware/esp32_cam_sender/esp32_cam_sender.ino` in Arduino IDE
 2. Install required library via Library Manager:
    - **ArduinoJson** by Benoit Blanchon (v6.x or v7.x)
-3. Edit Section 1 — set WiFi, Roboflow, and **receiver MAC**:
+3. WiFi and MAC addresses are pre-configured (auto-pairs with receiver, hardcoded MAC fallback):
    ```cpp
-   #define WIFI_SSID           "YourWiFiName"
-   #define WIFI_PASSWORD       "YourWiFiPassword"
+   #define WIFI_SSID           "Vivo_V29_5G"
+   #define WIFI_PASSWORD       "123456789"
    #define ROBOFLOW_API_URL    "https://detect.roboflow.com/YOUR_PROJECT/VERSION"
    #define ROBOFLOW_API_KEY    "YOUR_API_KEY"
    #define ROBOFLOW_TARGET_CLASS "ambulance"
    #define MONITORED_LANE_ID   0
-   static uint8_t RECEIVER_MAC[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
-   #define LCD_ENABLED         1
+   // Sender MAC:   A8:42:E3:56:83:2C
+   // Receiver MAC: FC:E8:C0:7A:B7:A0 (hardcoded fallback)
    ```
+   Edit Roboflow API details for your project.
 4. Board Settings:
    - Board: **AI Thinker ESP32-CAM**
    - Partition Scheme: **Huge APP (3MB No OTA/1MB SPIFFS)**
    - Upload Speed: 115200
 5. Connect FTDI adapter, hold IO0 to GND, press Reset, then Upload
 6. After upload: remove IO0 jumper, press Reset
-7. Open Serial Monitor at 115200 baud — note the IP address:
+7. Open Serial Monitor at 115200 baud — it auto-pairs with receiver:
    ```
+   [PAIR] Searching for receiver...
+   [PAIR] Beacon from FC:E8:C0:7A:B7:A0
+   [PAIR] PAIRED with receiver: FC:E8:C0:7A:B7:A0
    [WiFi] Connected! IP: 192.168.1.50
-   [HTTP] Trigger URL: http://192.168.1.50/trigger
    ```
 
 ### 5.5 Run Laptop ML → ESP32-CAM Trigger
@@ -263,7 +265,7 @@ The STM32 firmware is in `stm32_firmware/stm32_traffic_controller.c`. It's a bar
 - 4-direction traffic light FSM (10s green / 3s yellow / 1s all-red)
 - Pedestrian buttons (PB5-PB8) with walk phase
 - Emergency vehicle override via USART3 (receives `AMB:<lane>\n`)
-- 16x2 LCD display (bit-banged I2C on PC6/PC7)
+- 16x2 LCD display (on STM32 only, PC6/PC7 I2C)
 - Debug output on USART2 (ST-Link VCP) at 115200 baud
 
 ### 5.8 ESP32-CAM HTTP Endpoints
@@ -297,16 +299,17 @@ The STM32 firmware is in `stm32_firmware/stm32_traffic_controller.c`. It's a bar
 
 | Problem | Solution |
 |---------|----------|
-| ESP32-CAM WiFi won't connect | Double-check SSID/password, ensure 2.4 GHz network |
+| ESP32-CAM WiFi won't connect | Double-check SSID/password (`Vivo_V29_5G` / `123456789`), ensure 2.4 GHz network |
 | Roboflow API error | Verify API key, project URL, and internet access |
-| ESP-NOW send fails | Both ESP32s must be on same WiFi network (same channel) |
-| Receiver not getting messages | Verify receiver's MAC in sender matches actual MAC |
+| ESP-NOW send fails | Both ESP32s must be on same WiFi network (`Vivo_V29_5G`, same channel) |
+| Receiver not getting messages | Verify receiver MAC (`FC:E8:C0:7A:B7:A0`) matches. Use `find_mac_address.ino` to check |
 | Camera init fails | Ensure PSRAM present, check OV2640 ribbon cable |
-| LCD blank / not working | Try `LCD_I2C_ADDR 0x3F`, check wiring, ensure 5V power |
+| LCD blank / not working | LCD is on STM32 only (PC6/PC7). Try `LCD_I2C_ADDR 0x3F`, check wiring, ensure 5V power |
 | STM32 not responding | Check UART: ESP32 GPIO 17 → STM32 **PB11**, GND connected |
 | Detection too sensitive | Increase `--threshold` (e.g. 0.90) or `--consecutive` (e.g. 3) |
 | No audio input | Run `--list-devices`, check mic is connected |
 | Serial port permission | `sudo usermod -aG dialout $USER`, then re-login |
+| Need to find MAC address | Flash `esp32_firmware/find_mac_address/find_mac_address.ino` to the board |
 | TensorFlow import error | Use Python 3.10–3.12, not 3.13+ |
 
 ---
