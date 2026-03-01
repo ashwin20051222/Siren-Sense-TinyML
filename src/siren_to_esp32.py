@@ -13,14 +13,15 @@ The ESP32-CAM then:
   3. If confirmed, transmits LoRa alert to STM32 traffic controller
 
 Modes:
-    wifi  — sends HTTP GET to http://<ESP32_IP>/trigger
+    wifi  — sends HTTP GET to http://ambulance.local/trigger (auto-discovered)
     uart  — sends "SIREN\\n" over USB-UART serial
     both  — tries WiFi first, falls back to UART
 
 Usage:
-    python3 src/siren_to_esp32.py --mode wifi --esp32-ip 192.168.1.50
-    python3 src/siren_to_esp32.py --mode uart --port /dev/ttyUSB0
-    python3 src/siren_to_esp32.py --mode both --esp32-ip 192.168.1.50 --port /dev/ttyUSB0
+    python3 src/siren_to_esp32.py                           # auto-discovers ESP32
+    python3 src/siren_to_esp32.py --mode wifi                # same, explicit wifi
+    python3 src/siren_to_esp32.py --esp32-ip 192.168.1.50    # manual IP
+    python3 src/siren_to_esp32.py --mode uart --uart-port /dev/ttyUSB0
 
 Author:  Siren-Sense TinyML Project
 License: MIT
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import socket
 import sys
 import time
 from datetime import datetime
@@ -69,6 +71,81 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# Default mDNS hostname (must match MDNS_HOSTNAME in ambulance_detector.ino)
+MDNS_HOSTNAME = "ambulance"
+
+
+# ====================================================================
+# ESP32 AUTO-DISCOVERY via mDNS
+# ====================================================================
+
+def discover_esp32(hostname: str = MDNS_HOSTNAME, port: int = 80) -> Optional[str]:
+    """
+    Auto-discover ESP32-CAM on the local network using mDNS.
+    The ESP32 advertises itself as '<hostname>.local'.
+    Returns the IP address string, or None if not found.
+    """
+    mdns_name = f"{hostname}.local"
+    logger.info("[Discovery] Looking for ESP32 at %s ...", mdns_name)
+
+    # Method 1: Direct socket resolution (works on most Linux systems)
+    try:
+        ip = socket.getaddrinfo(mdns_name, port, socket.AF_INET)[0][4][0]
+        logger.info("[Discovery] ✅ Found ESP32 at %s (%s)", mdns_name, ip)
+        return ip
+    except socket.gaierror:
+        pass
+
+    # Method 2: Try with avahi-resolve (Linux with avahi-daemon)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["avahi-resolve", "-n", mdns_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            ip = result.stdout.strip().split()[-1]
+            logger.info("[Discovery] ✅ Found ESP32 via avahi: %s", ip)
+            return ip
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 3: Try with getent (some Linux systems)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["getent", "hosts", mdns_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            ip = result.stdout.strip().split()[0]
+            logger.info("[Discovery] ✅ Found ESP32 via getent: %s", ip)
+            return ip
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 4: Try zeroconf Python library if installed
+    try:
+        from zeroconf import Zeroconf, ServiceBrowser
+        import time as _time
+
+        zc = Zeroconf()
+        info = zc.get_service_info("_http._tcp.local.", f"{hostname}._http._tcp.local.", timeout=5000)
+        if info:
+            ip = socket.inet_ntoa(info.addresses[0])
+            logger.info("[Discovery] ✅ Found ESP32 via zeroconf: %s", ip)
+            zc.close()
+            return ip
+        zc.close()
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    logger.warning("[Discovery] Could not find %s on the network.", mdns_name)
+    logger.warning("[Discovery] Tip: install avahi-daemon:  sudo apt install avahi-daemon")
+    return None
 
 
 # ====================================================================
@@ -381,7 +458,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--esp32-ip", type=str, default=None,
-        help="ESP32-CAM IP address (required for wifi/both modes).",
+        help="ESP32-CAM IP address. Auto-discovered via mDNS if not given.",
     )
     parser.add_argument(
         "--http-port", type=int, default=80,
@@ -437,29 +514,29 @@ def main() -> None:
         print(sd.query_devices())
         return
 
+    # Auto-discover ESP32 if IP not given
+    if args.mode in ("wifi", "both") and not args.esp32_ip:
+        logger.info("No --esp32-ip given. Auto-discovering ESP32 via mDNS...")
+        discovered_ip = discover_esp32(port=args.http_port)
+        if discovered_ip:
+            args.esp32_ip = discovered_ip
+        else:
+            # Fall back to mDNS hostname directly (some systems resolve .local in urllib)
+            args.esp32_ip = f"{MDNS_HOSTNAME}.local"
+            logger.info("[Discovery] Using hostname: %s", args.esp32_ip)
+
     # Check ESP32 status if requested
     if args.check_esp32:
-        if not args.esp32_ip:
-            print("Error: --esp32-ip required for --check-esp32")
-            sys.exit(1)
-        status = get_esp32_status(args.esp32_ip, args.http_port)
+        ip = args.esp32_ip or f"{MDNS_HOSTNAME}.local"
+        status = get_esp32_status(ip, args.http_port)
         if status:
             import json
-            print("ESP32-CAM Status:")
+            print(f"ESP32-CAM Status (at {ip}):")
             print(json.dumps(status, indent=2))
         else:
-            print(f"Cannot reach ESP32-CAM at {args.esp32_ip}:{args.http_port}")
+            print(f"Cannot reach ESP32-CAM at {ip}:{args.http_port}")
+            print("Tip: Is your ESP32 powered on and on the same WiFi?")
         return
-
-    # Validate mode-specific args
-    if args.mode in ("wifi", "both") and not args.esp32_ip:
-        logger.error(
-            "ESP32-CAM IP address required for %s mode. "
-            "Use --esp32-ip <IP>. "
-            "Find it in ESP32 Serial Monitor output.",
-            args.mode,
-        )
-        sys.exit(1)
 
     # Initialize UART if needed
     if args.mode in ("uart", "both"):

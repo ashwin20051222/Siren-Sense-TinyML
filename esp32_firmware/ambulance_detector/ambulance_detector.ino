@@ -36,121 +36,20 @@
  *    python3 src/siren_to_esp32.py --mode wifi --esp32-ip <THIS_ESP32_IP>
  *
  * ============================================================================
- */
+ **/
 
+/* ---- Configuration (edit config.h, not this file) ---- */
+#include "config.h"
+
+/* ---- Libraries ---- */
 #include "base64.h"
 #include "esp_camera.h"
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <LoRa.h>
 #include <WebServer.h>
 #include <WiFi.h>
-
-/* =====================================================================
- *  USER CONFIGURATION — Edit these before flashing
- * ===================================================================== */
-
-/* ---- WiFi ---- */
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-
-/* ---- Roboflow API ----
- *  Go to https://app.roboflow.com → Your Project → Deploy → Hosted API
- *  Copy your model URL and API key.
- *
- *  URL format:
- *    https://detect.roboflow.com/<PROJECT>/<VERSION>
- *  Example:
- *    https://detect.roboflow.com/ambulance-detection/1
- *
- *  Response format (JSON):
- *  {
- *    "predictions": [
- *      { "class": "ambulance", "confidence": 0.92,
- *        "x": 320, "y": 240, "width": 200, "height": 150 }
- *    ],
- *    "image": { "width": 640, "height": 480 }
- *  }
- */
-#define ROBOFLOW_API_URL "https://detect.roboflow.com/YOUR_PROJECT/YOUR_VERSION"
-#define ROBOFLOW_API_KEY "YOUR_ROBOFLOW_API_KEY"
-#define ROBOFLOW_TIMEOUT_MS 15000 /* 15s timeout (image upload is slow) */
-#define ROBOFLOW_CONF_MIN 0.60    /* Min confidence to confirm ambulance */
-#define ROBOFLOW_TARGET_CLASS "ambulance" /* Class name trained in Roboflow */
-
-/* ---- Lane ID ----
- *   0 = North, 1 = East, 2 = South, 3 = West */
-#define MONITORED_LANE_ID 0
-
-/* ---- LoRa SX1278 Pins (HSPI) ---- */
-#define LORA_SCK_PIN 14
-#define LORA_MISO_PIN 12
-#define LORA_MOSI_PIN 13
-#define LORA_NSS_PIN 15
-#define LORA_RST_PIN 2
-#define LORA_DIO0_PIN 4
-
-/* ---- LoRa Radio Parameters — MUST match STM32 receiver ---- */
-#define LORA_FREQUENCY 433E6
-#define LORA_SPREADING_FACTOR 7
-#define LORA_BANDWIDTH 125E3
-#define LORA_CODING_RATE 5
-#define LORA_SYNC_WORD 0x12
-#define LORA_TX_POWER 17
-
-/* ---- Sound Sensor (Local Fallback) ---- */
-#define SOUND_SENSOR_PIN 33    /* ADC1_CH5, safe on ESP32-CAM */
-#define SOUND_THRESHOLD 2500   /* ADC value 0–4095 */
-#define SOUND_TRIGGER_COUNT 10 /* Consecutive loud readings */
-#define SOUND_SAMPLE_INTERVAL_MS 50
-
-/* ---- Trigger Mode ----
- *   0 = WiFi HTTP only
- *   1 = UART only ("SIREN\n" command from laptop)
- *   2 = Both WiFi + UART */
-#define TRIGGER_MODE 0
-
-/* ---- HTTP Server ---- */
-#define HTTP_TRIGGER_PORT 80
-
-/* ---- Timing ---- */
-#define DETECTION_COOLDOWN_MS 60000 /* 60s between alerts */
-#define LORA_RETRY_COUNT 3
-#define LORA_RETRY_DELAY_MS 500
-#define CAMERA_WARMUP_MS 500
-
-/* ---- Debug ---- */
-#define SERIAL_BAUD_RATE 115200
-#define DEBUG_ENABLED 1
-
-#if DEBUG_ENABLED
-#define DBG(...) Serial.printf(__VA_ARGS__)
-#define DBGLN(...) Serial.println(__VA_ARGS__)
-#else
-#define DBG(...)
-#define DBGLN(...)
-#endif
-
-/* =====================================================================
- *  CAMERA PIN DEFINITIONS — AI-Thinker ESP32-CAM (OV2640)
- * ===================================================================== */
-
-#define PWDN_GPIO_NUM 32
-#define RESET_GPIO_NUM -1
-#define XCLK_GPIO_NUM 0
-#define SIOD_GPIO_NUM 26
-#define SIOC_GPIO_NUM 27
-#define Y9_GPIO_NUM 35
-#define Y8_GPIO_NUM 34
-#define Y7_GPIO_NUM 39
-#define Y6_GPIO_NUM 36
-#define Y5_GPIO_NUM 21
-#define Y4_GPIO_NUM 19
-#define Y3_GPIO_NUM 18
-#define Y2_GPIO_NUM 5
-#define VSYNC_GPIO_NUM 25
-#define HREF_GPIO_NUM 23
-#define PCLK_GPIO_NUM 22
 
 /* =====================================================================
  *  GLOBAL STATE
@@ -642,6 +541,16 @@ void setup() {
   /* WiFi */
   wifiConnected = connectWiFi();
 
+  /* mDNS — makes ESP32 reachable as http://ambulance.local */
+  if (wifiConnected) {
+    if (MDNS.begin(MDNS_HOSTNAME)) {
+      MDNS.addService("http", "tcp", HTTP_TRIGGER_PORT);
+      DBG("[mDNS] Hostname: http://%s.local\n", MDNS_HOSTNAME);
+    } else {
+      DBGLN("[mDNS] Failed to start. Use IP address instead.");
+    }
+  }
+
   /* HTTP trigger server */
 #if TRIGGER_MODE == 0 || TRIGGER_MODE == 2
   if (wifiConnected)
@@ -669,8 +578,12 @@ void setup() {
   DBGLN("[Ready] Monitoring for triggers...");
   DBGLN("  Primary:  Laptop ML → HTTP /trigger");
   DBGLN("  Fallback: Local sound sensor (GPIO 33)");
-  DBGLN("  Laptop cmd: python3 src/siren_to_esp32.py --mode wifi --esp32-ip " +
-        WiFi.localIP().toString());
+  DBGLN("");
+  DBGLN("  === ONE-CLICK LAUNCH (on laptop) ===");
+  DBGLN("  ./start.sh");
+  DBGLN("  OR: python3 src/siren_to_esp32.py --mode wifi");
+  DBG("  mDNS: http://%s.local  |  IP: %s\n", MDNS_HOSTNAME,
+      WiFi.localIP().toString().c_str());
   DBGLN("");
 }
 
