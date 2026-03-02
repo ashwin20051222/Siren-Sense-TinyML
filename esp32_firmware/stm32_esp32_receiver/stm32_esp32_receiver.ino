@@ -1,42 +1,42 @@
 /**
  * ============================================================================
- *  STM32-ESP32 Receiver — ESP-NOW WiFi Receiver + UART Bridge to STM32
- *  Board: ESP32 DevKit (any standard ESP32, NOT ESP32-CAM)
+ * STM32-ESP32 Receiver — ESP-NOW WiFi Receiver + UART Bridge to STM32
+ * Board: ESP32 DevKit (any standard ESP32, NOT ESP32-CAM)
  * ============================================================================
  *
- *  SYSTEM ARCHITECTURE:
- *    ESP32-CAM (sender) ─── ESP-NOW WiFi ───► THIS ESP32 ─── UART ───► STM32
+ * SYSTEM ARCHITECTURE:
+ * ESP32-CAM (sender) ─── ESP-NOW WiFi ───► THIS ESP32 ─── UART ───► STM32
  *
- *  WHAT THIS DOES:
- *    1. Broadcasts "PAIR:RCV" beacon until sender auto-discovers this board
- *    2. Receives "AMB:<lane_id>" messages from ESP32-CAM via ESP-NOW
- *    3. Forwards them to STM32 via UART (Serial2, GPIO 17 TX)
- *    4. Blinks LED on alert receipt
+ * WHAT THIS DOES:
+ * 1. Broadcasts "PAIR:RCV" beacon until sender auto-discovers this board
+ * 2. Receives "AMB:<lane_id>" messages from ESP32-CAM via ESP-NOW
+ * 3. Forwards them to STM32 via UART (Serial2, GPIO 17 TX)
+ * 4. Blinks LED on alert receipt
  *
- *  MAC ADDRESSES:
- *    This board (Receiver): FC:E8:C0:7A:B7:A0
- *    Sender (ESP32-CAM):    A8:42:E3:56:83:2C
- *    Use esp32_firmware/find_mac_address/ sketch to find your board's MAC.
+ * MAC ADDRESSES:
+ * This board (Receiver): FC:E8:C0:7A:B7:A0
+ * Sender (ESP32-CAM):    A8:42:E3:56:83:2C
+ * Use esp32_firmware/find_mac_address/ sketch to find your board's MAC.
  *
- *  AUTO-PAIRING:
- *    On boot, this receiver broadcasts a "PAIR:RCV" beacon every 2 seconds.
- *    The sender (A8:42:E3:56:83:2C) auto-discovers this board, adds it as a
- *    peer, and sends "PAIR:ACK" to confirm. LED blinks fast during pairing,
- *    then shows brief solid to confirm paired.
+ * AUTO-PAIRING:
+ * On boot, this receiver broadcasts a "PAIR:RCV" beacon every 2 seconds.
+ * The sender (A8:42:E3:56:83:2C) auto-discovers this board, adds it as a
+ * peer, and sends "PAIR:ACK" to confirm. LED blinks fast during pairing,
+ * then shows brief solid to confirm paired.
  *
- *  LIBRARIES:
- *    - ESP32 Board Package (esp32 by Espressif, v2.x+)
+ * LIBRARIES:
+ * - ESP32 Board Package (esp32 by Espressif, v2.x+)
  *
- *  WIRING (only 3 wires!):
- *    ESP32 GPIO 17 (TX2) ──► STM32 PB11 (USART3 RX)
- *    ESP32 GPIO 16 (RX2) ──► STM32 PB10 (USART3 TX) [optional]
- *    ESP32 GND            ──► STM32 GND (MUST be common ground!)
- *    ESP32 5V             ──► USB power
+ * WIRING (only 3 wires!):
+ * ESP32 GPIO 17 (TX2) ──► STM32 PB11 (USART3 RX)
+ * ESP32 GPIO 16 (RX2) ──► STM32 PB10 (USART3 TX) [optional]
+ * ESP32 GND            ──► STM32 GND (MUST be common ground!)
+ * ESP32 5V             ──► USB power
  *
- *  WiFi: Vivo_V29_5G (2.4 GHz) — both boards must be on the SAME network.
- *  NOTE: LCD display is connected to the STM32 (PC6/PC7), NOT this ESP32.
+ * WiFi: Vivo_V29_5G (2.4 GHz) — both boards must be on the SAME network.
+ * NOTE: LCD display is connected to the STM32 (PC6/PC7), NOT this ESP32.
  * ============================================================================
- */
+ **/
 
 #include <WiFi.h>
 #include <esp_now.h>
@@ -47,8 +47,8 @@
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 /* ---- WiFi (2.4 GHz only) ----
- *  Must be on the SAME network/channel as ESP32-CAM sender
- *  for ESP-NOW to work reliably */
+ * Must be on the SAME network/channel as ESP32-CAM sender
+ * for ESP-NOW to work reliably */
 #define WIFI_SSID "Vivo_V29_5G"
 #define WIFI_PASSWORD "123456789"
 
@@ -82,28 +82,33 @@ static const uint8_t KNOWN_SENDER_MAC[] = {0xA8, 0x42, 0xE3, 0x56, 0x83, 0x2C};
 #endif
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 2: GLOBAL STATE                                        ║
+ * ║  SECTION 2: GLOBAL STATE & QUEUE                                ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 static const char *LANE_NAMES[] = {"NORTH", "EAST", "SOUTH", "WEST"};
 
+/* FreeRTOS Queue: passes data from WiFi callback to main loop without
+   volatile globals, priority inversion, or dropped messages. */
+typedef struct {
+  uint8_t mac[6];
+  char msg[32];
+} EspNowMsg_t;
+
+QueueHandle_t espNowQueue = NULL;
+
 static bool wifiConnected = false;
 static bool espNowInitialized = false;
 
-/* Auto-pairing state */
+/* Auto-pairing state (no longer volatile — only accessed in loop) */
 static bool paired = false;
 static uint8_t senderMAC[6] = {0};
 static uint32_t lastBeaconTime = 0;
-
-/* Received message state */
-static volatile bool newMessageReceived = false;
-static char lastReceivedMsg[32] = "";
-static uint8_t lastSenderMAC[6] = {0};
 static uint32_t totalMessagesReceived = 0;
 static uint32_t lastReceiveTime = 0;
 
-/* LED blink */
-static uint32_t ledOffTime = 0;
+/* LED blink state (only accessed in loop) */
+static uint32_t ledTurnedOnTime = 0;
+static uint32_t ledDuration = 0;
 static bool ledOn = false;
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
@@ -115,6 +120,9 @@ bool connectWiFi(void) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setSleep(false);
+  /* Prevent channel hopping if the AP drops — ESP-NOW requires both
+     radios locked to the same channel. Auto-reconnect scans ch1-13. */
+  WiFi.setAutoReconnect(false);
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
@@ -129,44 +137,20 @@ bool connectWiFi(void) {
   return false;
 }
 
-/* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 4: ESP-NOW AUTO-PAIRING + RECEIVER                    ║
- * ╚═══════════════════════════════════════════════════════════════════╝ */
-
-/* ESP-NOW receive callback — handles both pairing ACK and ambulance messages */
-void onEspNowReceive(const uint8_t *mac_addr, const uint8_t *data, int len) {
-  if (len <= 0 || len >= (int)sizeof(lastReceivedMsg))
+/* ESP-NOW receive callback — runs in high-priority WiFi task.
+   ZERO logic, ZERO Serial, ZERO blocking. Just enqueue and return. */
+void onEspNowReceive(const esp_now_recv_info_t *info, const uint8_t *data,
+                     int len) {
+  if (len <= 0 || len >= 32 || espNowQueue == NULL)
     return;
 
-  /* Temporary buffer to check message */
-  char msg[32];
-  memcpy(msg, data, len);
-  msg[len] = '\0';
+  EspNowMsg_t rxData;
+  memcpy(rxData.mac, info->src_addr, 6);
+  memcpy(rxData.msg, data, len);
+  rxData.msg[len] = '\0';
 
-  /* Check for PAIR:ACK from sender */
-  if (!paired && strcmp(msg, PAIR_ACK_MSG) == 0) {
-    paired = true;
-    memcpy(senderMAC, mac_addr, 6);
-    DBG("\n[PAIR] ✅ PAIRED with sender: %02X:%02X:%02X:%02X:%02X:%02X\n",
-        mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4],
-        mac_addr[5]);
-
-    /* Brief LED solid on to confirm pairing */
-    digitalWrite(LED_PIN, HIGH);
-    delay(500);
-    digitalWrite(LED_PIN, LOW);
-    return;
-  }
-
-  /* Normal message (e.g., AMB:0) */
-  memcpy(lastReceivedMsg, msg, len + 1);
-  memcpy(lastSenderMAC, mac_addr, 6);
-  newMessageReceived = true;
-  totalMessagesReceived++;
-
-  DBG("[ESP-NOW] RX from %02X:%02X:%02X:%02X:%02X:%02X: \"%s\"\n", mac_addr[0],
-      mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
-      lastReceivedMsg);
+  /* Non-blocking enqueue (0 ticks wait — never stall the WiFi task) */
+  xQueueSend(espNowQueue, &rxData, 0);
 }
 
 bool initEspNow(void) {
@@ -182,7 +166,13 @@ bool initEspNow(void) {
   memset(bcastPeer.peer_addr, 0xFF, 6); /* FF:FF:FF:FF:FF:FF = broadcast */
   bcastPeer.channel = 0;
   bcastPeer.encrypt = false;
-  esp_now_add_peer(&bcastPeer);
+  bcastPeer.ifidx =
+      WIFI_IF_STA; /* Explicitly bind to Station interface (ESP32 Core v3) */
+
+  if (esp_now_add_peer(&bcastPeer) != ESP_OK) {
+    DBGLN("[ESP-NOW] Failed to add broadcast peer!");
+    return false;
+  }
 
   DBGLN("[ESP-NOW] Receiver initialized with auto-pairing.");
   return true;
@@ -213,6 +203,21 @@ void initSTM32UART(void) {
 void forwardToSTM32(const char *msg) {
   Serial2.println(msg);
   DBG("[UART] Forwarded to STM32: \"%s\"\n", msg);
+}
+
+/* Send acknowledgment back to ESP32-CAM sender via ESP-NOW */
+void sendAckToCamera(void) {
+  if (!paired)
+    return;
+
+  const char *ackMsg = "ACK:AMB";
+  esp_err_t result =
+      esp_now_send(senderMAC, (const uint8_t *)ackMsg, strlen(ackMsg));
+  if (result == ESP_OK) {
+    DBG("[ESP-NOW] TX: Sent ACK to camera -> \"%s\"\n", ackMsg);
+  } else {
+    DBG("[ESP-NOW] TX: Failed to send ACK (Error: %d)\n", result);
+  }
 }
 
 /* Parse and validate AMB:<lane_id> message */
@@ -258,6 +263,14 @@ void setup() {
   /* UART to STM32 */
   initSTM32UART();
 
+  /* FreeRTOS Queue: buffers up to 10 messages between callback and loop */
+  espNowQueue = xQueueCreate(10, sizeof(EspNowMsg_t));
+  if (espNowQueue == NULL) {
+    DBGLN("[FATAL] Could not create FreeRTOS Queue!");
+    while (1)
+      ; /* halt — cannot operate without the queue */
+  }
+
   /* ESP-NOW receiver with auto-pairing */
   espNowInitialized = initEspNow();
 
@@ -265,6 +278,7 @@ void setup() {
   DBGLN("\n-------- SYSTEM STATUS --------");
   DBG("  WiFi:     %s\n", wifiConnected ? "OK" : "FAIL");
   DBG("  ESP-NOW:  %s\n", espNowInitialized ? "OK" : "FAIL");
+  DBG("  Queue:    OK (10 slots)\n");
   DBG("  UART TX:  GPIO %d @ %d baud\n", STM32_TX_PIN, STM32_UART_BAUD);
   DBGLN("  LCD:      On STM32 (not this board)");
   DBGLN("  Pairing:  Broadcasting beacon...");
@@ -283,55 +297,98 @@ void loop() {
     sendPairingBeacon();
 
     /* Fast-blink LED while waiting for pairing */
-    if ((now / 200) % 2)
-      digitalWrite(LED_PIN, HIGH);
-    else
-      digitalWrite(LED_PIN, LOW);
-
-    delay(10);
-    return; /* Don't process ambulance messages until paired */
+    digitalWrite(LED_PIN, ((now / 200) % 2) ? HIGH : LOW);
   }
 
-  /* ---- NORMAL OPERATION (paired) ---- */
+  /* ---- QUEUE PROCESSING ---- */
+  EspNowMsg_t rxData;
+  /* Process one message per loop tick to prevent task starvation.
+     A while() loop here would starve the RTOS if the sender floods packets
+     faster than Serial can print, triggering a TWDT crash. */
+  if (xQueueReceive(espNowQueue, &rxData, 0) == pdTRUE) {
 
-  /* Process received ESP-NOW message */
-  if (newMessageReceived) {
-    newMessageReceived = false;
-    lastReceiveTime = now;
+    /* 1. Handle Pairing Response */
+    if (!paired && strcmp(rxData.msg, PAIR_ACK_MSG) == 0) {
+      paired = true;
+      memcpy(senderMAC, rxData.mac, 6);
 
-    /* Validate message */
-    uint8_t laneId = 0;
-    if (parseAmbulanceMessage(lastReceivedMsg, &laneId)) {
-      DBG("\n╔══════════════════════════════════════╗\n");
-      DBG("║  AMBULANCE ALERT! Lane %d (%s)\n", laneId,
-          (laneId < 4) ? LANE_NAMES[laneId] : "???");
-      DBG("║  From: %02X:%02X:%02X:%02X:%02X:%02X\n", lastSenderMAC[0],
-          lastSenderMAC[1], lastSenderMAC[2], lastSenderMAC[3],
-          lastSenderMAC[4], lastSenderMAC[5]);
-      DBG("╚══════════════════════════════════════╝\n\n");
+      /* Register sender as ESP-NOW peer for two-way communication (ACK) */
+      esp_now_peer_info_t senderPeer = {};
+      memcpy(senderPeer.peer_addr, senderMAC, 6);
+      senderPeer.channel = 0;
+      senderPeer.encrypt = false;
+      senderPeer.ifidx = WIFI_IF_STA;
 
-      /* Forward to STM32 via UART */
-      forwardToSTM32(lastReceivedMsg);
+      if (esp_now_add_peer(&senderPeer) == ESP_OK) {
+        DBG("\n[PAIR] ✅ PAIRED and REGISTERED sender: "
+            "%02X:%02X:%02X:%02X:%02X:%02X\n",
+            rxData.mac[0], rxData.mac[1], rxData.mac[2], rxData.mac[3],
+            rxData.mac[4], rxData.mac[5]);
+      } else {
+        DBG("\n[PAIR] ⚠️ PAIRED, but failed to register sender peer!\n");
+      }
 
-      /* Blink LED */
       digitalWrite(LED_PIN, HIGH);
       ledOn = true;
-      ledOffTime = now + LED_BLINK_MS;
-    } else {
-      DBG("[Warning] Unknown message: \"%s\"\n", lastReceivedMsg);
+      ledTurnedOnTime = now;
+      ledDuration = 1000;
+    }
+
+    /* 2. Handle Normal Messages (Only if paired) */
+    else if (paired) {
+      totalMessagesReceived++;
+      lastReceiveTime = now;
+
+      /* Self-heal if camera hardware is replaced (new MAC) */
+      if (memcmp(senderMAC, rxData.mac, 6) != 0) {
+        DBG("[PAIR] 🔄 Camera MAC changed! Updating peer...\n");
+        esp_now_del_peer(senderMAC);
+        memcpy(senderMAC, rxData.mac, 6);
+
+        esp_now_peer_info_t newPeer = {};
+        memcpy(newPeer.peer_addr, senderMAC, 6);
+        newPeer.channel = 0;
+        newPeer.encrypt = false;
+        newPeer.ifidx = WIFI_IF_STA;
+        esp_now_add_peer(&newPeer);
+      }
+
+      uint8_t laneId = 0;
+      if (parseAmbulanceMessage(rxData.msg, &laneId)) {
+        DBG("\n╔══════════════════════════════════════╗\n");
+        DBG("║  AMBULANCE ALERT! Lane %d (%s)\n", laneId,
+            (laneId < 4) ? LANE_NAMES[laneId] : "???");
+        DBG("║  From: %02X:%02X:%02X:%02X:%02X:%02X\n", rxData.mac[0],
+            rxData.mac[1], rxData.mac[2], rxData.mac[3], rxData.mac[4],
+            rxData.mac[5]);
+        DBG("╚══════════════════════════════════════╝\n\n");
+
+        /* Forward to STM32 via UART */
+        forwardToSTM32(rxData.msg);
+
+        /* Send confirmation back to ESP32-CAM */
+        sendAckToCamera();
+
+        /* Blink LED */
+        digitalWrite(LED_PIN, HIGH);
+        ledOn = true;
+        ledTurnedOnTime = now;
+        ledDuration = LED_BLINK_MS;
+      } else {
+        DBG("[Warning] Unknown message: \"%s\"\n", rxData.msg);
+      }
     }
   }
 
-  /* LED auto-off */
-  if (ledOn && now >= ledOffTime) {
+  /* ---- LED AUTO-OFF (rollover-safe) ---- */
+  if (ledOn && (now - ledTurnedOnTime >= ledDuration)) {
     digitalWrite(LED_PIN, LOW);
     ledOn = false;
   }
 
-  /* Also check if STM32 sends anything back (optional) */
+  /* ---- UART BRIDGE READ ---- */
   while (Serial2.available()) {
-    char c = Serial2.read();
-    Serial.write(c);
+    Serial.write(Serial2.read());
   }
 
   delay(10);

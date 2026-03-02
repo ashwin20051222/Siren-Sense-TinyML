@@ -95,6 +95,10 @@ typedef struct {
 #define RCC_APB2ENR_IOPDEN (1U << 5)
 #define RCC_APB2ENR_AFIOEN (1U << 0)
 
+/* Interrupt control (Cortex-M3 CPSID/CPSIE) */
+#define __disable_irq() __asm volatile("cpsid i" ::: "memory")
+#define __enable_irq() __asm volatile("cpsie i" ::: "memory")
+
 /* IR Sensor pins (Input Pull-Up, active-low) */
 #define IR_NORTH_PORT GPIOC
 #define IR_NORTH_PIN 11
@@ -129,6 +133,8 @@ typedef struct {
   2000                           /* time to clear current lane before override \
                                   */
 #define EMERGENCY_GREEN_MS 15000 /* emergency lane green duration */
+#define IR_EXTEND_MAX_MS 5000    /* max IR extension beyond GREEN_TIME_MS */
+#define EMERGENCY_RED_GAP_MS 500 /* all-red gap after emergency yellow */
 
 /* LCD I2C */
 #define LCD_I2C_ADDR 0x27 /* PCF8574 address (try 0x3F if blank) */
@@ -163,15 +169,23 @@ typedef enum {
 static TrafficState_t currentState = STATE_GREEN;
 static uint8_t activeLane = LANE_NORTH;
 static uint32_t stateStartMs = 0;
+static uint8_t stateFirstRun =
+    1; /* Flag to ensure LEDs are set on state entry */
 
 /* Pedestrian */
 static uint8_t pedRequested[NUM_LANES] = {0, 0, 0, 0};
 static uint8_t pedActiveForLane = 0;
+static uint8_t btnPrevState[NUM_LANES] = {1, 1, 1,
+                                          1}; /* 1 = released (pull-up) */
+static uint8_t pedPendingAfterYellow = 0; /* route ped request through yellow */
+static uint8_t savedLaneBeforeEmergency = 0; /* resume cycle after emergency */
 
 /* Emergency */
 static volatile uint8_t emergencyRequested = 0;
 static volatile uint8_t emergencyLane = 0;
 static uint8_t emergencyActive = 0;
+static uint8_t emergencyRedGapDone =
+    0; /* ensures all_red() fires once in clear gap */
 
 /* USART3 receive buffer */
 #define UART_BUF_SIZE 32
@@ -197,9 +211,13 @@ static void delay_ms(uint32_t ms) {
     ;
 }
 
+/* Safe on Cortex-M3: 32-bit aligned load is atomic (single LDR instruction).
+   Would need __disable_irq() on architectures without this guarantee. */
 static uint32_t millis(void) { return msTicks; }
 
-/* GPIO configuration helper */
+/* GPIO configuration helper
+   WARNING: This RMW is NOT interrupt-safe. If any ISR modifies the same
+   GPIO port's CRL/CRH, wrap calls in __disable_irq/__enable_irq. */
 static void gpio_set_mode(GPIO_TypeDef *port, uint8_t pin, uint8_t mode_cnf) {
   /* mode_cnf: 4 bits (CNFx[1:0] | MODEx[1:0]) */
   if (pin < 8) {
@@ -228,14 +246,27 @@ static uint8_t gpio_read(GPIO_TypeDef *port, uint8_t pin) {
  * ║  SECTION 4: CLOCK SETUP (72 MHz from 8 MHz HSE)                 ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
+/* Forward declaration — defined in Section 14 (startup). Called here if
+   HSE/PLL fails, to enter safe all-red fault state. */
+void Default_Handler(void);
+
 static void SystemClock_Config(void) {
   /* Enable HSE (8 MHz on NUCLEO from ST-Link) */
   RCC->CR |= (1U << 16); /* HSEON */
-  while (!(RCC->CR & (1U << 17)))
-    ; /* Wait HSE ready */
+  {
+    uint32_t timeout = 500000U; /* ~50ms at default HSI 8MHz */
+    while (!(RCC->CR & (1U << 17)) && --timeout)
+      ;
+    if (!timeout) {
+      /* HSE failed — UART baud rates depend on 36 MHz APB1 clock.
+         Limping at 8 MHz would garble all ESP32 comms. Halt safely. */
+      Default_Handler();
+    }
+  }
 
-  /* Flash: 2 wait states for 72 MHz */
-  *(volatile uint32_t *)0x40022000 |= 0x02;
+  /* Flash ACR: clear LATENCY[2:0] then set 2 wait states for 72 MHz */
+  volatile uint32_t *FLASH_ACR = (volatile uint32_t *)0x40022000;
+  *FLASH_ACR = (*FLASH_ACR & ~0x07U) | 0x02U;
 
   /* PLL: HSE / 1 * 9 = 72 MHz */
   RCC->CFGR |= (1U << 16); /* PLLSRC = HSE */
@@ -244,8 +275,15 @@ static void SystemClock_Config(void) {
 
   /* Enable PLL */
   RCC->CR |= (1U << 24); /* PLLON */
-  while (!(RCC->CR & (1U << 25)))
-    ; /* Wait PLL ready */
+  {
+    uint32_t timeout = 500000U;
+    while (!(RCC->CR & (1U << 25)) && --timeout)
+      ;
+    if (!timeout) {
+      /* PLL failed — UART baud rates will be wrong. Halt safely. */
+      Default_Handler();
+    }
+  }
 
   /* Switch to PLL */
   RCC->CFGR |= (2U << 0); /* SW = PLL */
@@ -313,8 +351,10 @@ static void GPIO_Init(void) {
   gpio_set_mode(GPIOB, 8, 0x08);
   GPIOB->ODR |= (1U << 5) | (1U << 6) | (1U << 7) | (1U << 8); /* Pull-up */
 
-  /* --- User LED PC13 (Push-Pull Output, inverted on NUCLEO) --- */
-  gpio_set_mode(GPIOC, 13, 0x02);
+  /* --- User LED PA5 (Push-Pull Output, active-high on NUCLEO-F103RB) --- */
+  /* NOTE: PC13 is the User Button on Nucleo — setting it as push-pull output
+     risks a VDD-to-GND short if the button is pressed. PA5 = LD2 (green). */
+  gpio_set_mode(GPIOA, 5, 0x02);
 
   /* --- IR Sensors (Input Pull-Up, active-low) --- */
   /* PC11(N), PC12(E), PD2(S), PA12(W) */
@@ -416,7 +456,15 @@ static void USART3_Init(void) {
 
 /* USART3 interrupt handler — receives "AMB:<lane>\n" from ESP32 */
 void USART3_IRQHandler(void) {
-  if (USART3->SR & USART_SR_RXNE) {
+  /* Clear error flags (ORE/NE/FE/PE) FIRST to prevent ISR re-entry loop.
+     On STM32F103, reading SR then DR clears ORE (RM0008 §27.6.1). */
+  uint32_t sr = USART3->SR;
+  if (sr & 0x0FU) {   /* ORE|NE|FE|PE bits [3:0] */
+    (void)USART3->DR; /* Read DR to clear error flags */
+    return;           /* Discard corrupted byte */
+  }
+
+  if (sr & USART_SR_RXNE) {
     char c = (char)(USART3->DR & 0xFF);
 
     if (c == '\n' || c == '\r') {
@@ -436,8 +484,7 @@ void USART3_IRQHandler(void) {
     } else {
       if (uartIdx < UART_BUF_SIZE - 1)
         uartBuf[uartIdx++] = c;
-      else
-        uartIdx = 0;
+      /* If buffer full, silently drop chars until next \n flushes */
     }
   }
 }
@@ -446,11 +493,16 @@ void USART3_IRQHandler(void) {
  * ║  SECTION 8: BIT-BANGED I2C + LCD DRIVER (PC6=SDA, PC7=SCL)     ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
-/* Microsecond-ish delay (approximate at 72 MHz) */
+/* Microsecond-ish delay (approximate at 72 MHz)
+   Uses NOP instructions for deterministic timing regardless of
+   compiler optimization level or Flash wait-state configuration. */
 static void i2c_delay(void) {
-  volatile uint32_t n = 36; /* ~5µs at 72 MHz */
-  while (n--)
-    ;
+  /* ~5µs at 72 MHz ≈ 360 cycles. Each NOP = 1 cycle on Cortex-M3.
+     Loop overhead adds ~4 cycles/iteration, so 36 iterations ≈ 180 cycles.
+     Two calls per I2C half-clock gives adequate setup/hold time. */
+  for (volatile uint32_t n = 36; n > 0; n--) {
+    __asm volatile("nop");
+  }
 }
 
 #define SDA_HIGH() gpio_write(GPIOC, 6, 1)
@@ -480,7 +532,7 @@ static void i2c_stop(void) {
 
 static void i2c_write_byte(uint8_t data) {
   for (int i = 7; i >= 0; i--) {
-    if (data & (1 << i))
+    if (data & (1U << i)) /* MISRA-C 12.2: unsigned shift operand */
       SDA_HIGH();
     else
       SDA_LOW();
@@ -508,7 +560,10 @@ static void lcd_i2c_send(uint8_t data) {
 
 static void lcd_pulse(uint8_t data) {
   lcd_i2c_send(data | LCD_EN);
+  i2c_delay(); /* HD44780 needs EN pulse width >= 450ns */
+  i2c_delay();
   lcd_i2c_send(data & ~LCD_EN);
+  i2c_delay();
 }
 
 static void lcd_send_nibble(uint8_t nibble, uint8_t mode) {
@@ -529,19 +584,23 @@ static void lcd_cmd(uint8_t cmd) {
 static void lcd_data(uint8_t ch) { lcd_send_byte(ch, LCD_RS); }
 
 static void lcd_init(void) {
-  delay_ms(50);
+  delay_ms(50); /* Power-on delay (HD44780 needs >40ms) */
   lcd_send_nibble(0x30, 0);
-  delay_ms(5);
+  delay_ms(5); /* Wait >4.1ms */
   lcd_send_nibble(0x30, 0);
-  delay_ms(5);
+  delay_ms(2); /* Wait >100us */
   lcd_send_nibble(0x30, 0);
+  delay_ms(2);
+  lcd_send_nibble(0x20, 0); /* Switch to 4-bit mode */
+  delay_ms(2);              /* Wait for mode switch to complete */
+  lcd_cmd(0x28);            /* 4-bit, 2 lines, 5x8 */
   delay_ms(1);
-  lcd_send_nibble(0x20, 0);
-  delay_ms(1);
-  lcd_cmd(0x28); /* 4-bit, 2 lines, 5x8 */
   lcd_cmd(0x0C); /* Display on, cursor off */
+  delay_ms(1);
   lcd_cmd(0x01); /* Clear */
+  delay_ms(3);   /* Clear command needs >1.52ms */
   lcd_cmd(0x06); /* Entry mode: increment */
+  delay_ms(1);
 }
 
 static void lcd_set_cursor(uint8_t row, uint8_t col) {
@@ -604,6 +663,8 @@ static const PedestrianLight_t PL[NUM_LANES] = {
 
 /* Set a single traffic light color */
 static void tl_set(uint8_t lane, uint8_t r, uint8_t y, uint8_t g) {
+  if (lane >= NUM_LANES)
+    return; /* MISRA-C 18.1: bounds guard */
   gpio_write(TL[lane].rPort, TL[lane].rPin, r);
   gpio_write(TL[lane].yPort, TL[lane].yPin, y);
   gpio_write(TL[lane].gPort, TL[lane].gPin, g);
@@ -611,6 +672,8 @@ static void tl_set(uint8_t lane, uint8_t r, uint8_t y, uint8_t g) {
 
 /* Set pedestrian LEDs */
 static void ped_set(uint8_t lane, uint8_t red, uint8_t green) {
+  if (lane >= NUM_LANES)
+    return; /* MISRA-C 18.1: bounds guard */
   gpio_write(PL[lane].rPort, PL[lane].rPin, red);
   gpio_write(PL[lane].gPort, PL[lane].gPin, green);
 }
@@ -660,8 +723,8 @@ static void scan_pedestrian_buttons(void) {
   lastBtnScan = now;
 
   for (int i = 0; i < NUM_LANES; i++) {
-    if (!gpio_read(PL[i].btnPort,
-                   PL[i].btnPin)) { /* Button pressed (active LOW) */
+    uint8_t btnNow = gpio_read(PL[i].btnPort, PL[i].btnPin);
+    if (!btnNow && btnPrevState[i]) { /* Falling edge (1->0): button press */
       if (!pedRequested[i]) {
         pedRequested[i] = 1;
         uart2_puts("[PED] Button pressed: ");
@@ -669,6 +732,7 @@ static void scan_pedestrian_buttons(void) {
         uart2_puts("\r\n");
       }
     }
+    btnPrevState[i] = btnNow;
   }
 }
 
@@ -679,41 +743,88 @@ static void scan_pedestrian_buttons(void) {
 static void enter_state(TrafficState_t state) {
   currentState = state;
   stateStartMs = millis();
+  stateFirstRun = 1; /* LED/output update on first FSM tick */
 }
 
 static void next_lane(void) { activeLane = (activeLane + 1) % NUM_LANES; }
 
 static void traffic_fsm_update(void) {
+  /* NOTE: unsigned subtraction handles uint32_t rollover correctly (~49.7
+     days). Do NOT change these to signed types. */
   uint32_t elapsed = millis() - stateStartMs;
 
+  /* Atomically read + clear emergency request with PRIMASK preservation.
+     Saves/restores interrupt state for safe nested critical sections. */
+  uint32_t primask;
+  __asm volatile("mrs %0, primask" : "=r"(primask)); /* save IRQ state */
+  __disable_irq();
+  uint8_t emReq = emergencyRequested;
+  uint8_t emLane = emergencyLane;
+  emergencyRequested = 0;
+  if (primask == 0U) {
+    __enable_irq(); /* only re-enable if IRQs were enabled before */
+  }
+
   /* Check emergency request (highest priority) */
-  if (emergencyRequested && currentState != STATE_EMERGENCY_CLEAR &&
-      currentState != STATE_EMERGENCY_GREEN) {
-    emergencyRequested = 0;
+  if (emReq) {
+    if (emergencyActive && currentState == STATE_EMERGENCY_GREEN &&
+        activeLane == emLane) {
+      /* Same lane already green for emergency — extend timer */
+      stateStartMs = millis();
+      uart2_puts("[EMG] Extended emergency on lane ");
+      uart2_print_num(emLane);
+      uart2_puts("\r\n");
+      return;
+    }
+
+    /* Only save cycle position on FIRST emergency entry — preserves
+       original lane if back-to-back emergencies arrive. */
+    if (!emergencyActive) {
+      savedLaneBeforeEmergency = activeLane;
+    }
     emergencyActive = 1;
+    emergencyLane = emLane; /* update global for LCD */
     uart2_puts("\r\n*** EMERGENCY VEHICLE! Lane ");
-    uart2_putc('0' + emergencyLane);
+    uart2_print_num(emLane);
     uart2_puts(" (");
-    uart2_puts(LANE_NAMES[emergencyLane]);
+    uart2_puts(LANE_NAMES[emLane]);
     uart2_puts(") ***\r\n");
 
     /* If we're already on the emergency lane and green, just hold it */
-    if (activeLane == emergencyLane && currentState == STATE_GREEN) {
+    if (activeLane == emLane && currentState == STATE_GREEN) {
       enter_state(STATE_EMERGENCY_GREEN);
-      set_green(emergencyLane);
+      set_green(emLane);
       return;
     }
 
     /* Otherwise, quickly clear current traffic */
-    set_yellow(activeLane);
+    /* If interrupting a pedestrian phase, force DON'T WALK */
+    if (currentState == STATE_PED_WALK || currentState == STATE_PED_FLASH) {
+      ped_set(pedActiveForLane, 1, 0); /* DON'T WALK */
+      pedPendingAfterYellow = 0;       /* cancel any pending ped */
+    }
+
+    /* Determine if vehicles are already stopped (non-GREEN state).
+       If so, skip the yellow clearance — showing yellow to stopped cars
+       is dangerous (signals them to prepare to move as ambulance arrives). */
+    uint8_t wasGreen =
+        (currentState == STATE_GREEN || currentState == STATE_EMERGENCY_GREEN);
     enter_state(STATE_EMERGENCY_CLEAR);
+    emergencyRedGapDone = 0;
+    if (!wasGreen) {
+      stateFirstRun = 0;       /* prevent set_yellow() in stateFirstRun */
+      all_red();               /* assert red immediately (executed once) */
+      emergencyRedGapDone = 1; /* skip redundant all_red in gap phase */
+      stateStartMs -= EMERGENCY_CLEAR_MS; /* fast-forward to red gap phase */
+    }
     return;
   }
 
   switch (currentState) {
 
   case STATE_GREEN:
-    if (elapsed == 0) {
+    if (stateFirstRun) {
+      stateFirstRun = 0;
       set_green(activeLane);
       uart2_puts("[TL] GREEN -> ");
       uart2_puts(LANE_NAMES[activeLane]);
@@ -721,16 +832,16 @@ static void traffic_fsm_update(void) {
     }
 
     if (elapsed >= GREEN_TIME_MS) {
-      /* Check if pedestrian requested for this lane */
+      /* Pedestrian check takes priority over IR extension */
       if (pedRequested[activeLane]) {
         pedRequested[activeLane] = 0;
         pedActiveForLane = activeLane;
-        enter_state(STATE_PED_WALK);
-        /* Keep current lane green, activate ped green */
-        ped_set(activeLane, 0, 1); /* WALK */
-        uart2_puts("[PED] Walk phase -> ");
-        uart2_puts(LANE_NAMES[activeLane]);
-        uart2_puts("\r\n");
+        pedPendingAfterYellow = 1;
+        set_yellow(activeLane);
+        enter_state(STATE_YELLOW);
+      } else if (ir_read(activeLane) &&
+                 elapsed < GREEN_TIME_MS + IR_EXTEND_MAX_MS) {
+        break; /* extend green for vehicles */
       } else {
         set_yellow(activeLane);
         enter_state(STATE_YELLOW);
@@ -739,6 +850,13 @@ static void traffic_fsm_update(void) {
     break;
 
   case STATE_PED_WALK:
+    if (stateFirstRun) {
+      stateFirstRun = 0;
+      ped_set(pedActiveForLane, 0, 1); /* WALK */
+      uart2_puts("[PED] Walk phase -> ");
+      uart2_puts(LANE_NAMES[pedActiveForLane]);
+      uart2_puts("\r\n");
+    }
     if (elapsed >= PED_WALK_TIME_MS) {
       enter_state(STATE_PED_FLASH);
     }
@@ -754,8 +872,8 @@ static void traffic_fsm_update(void) {
 
     if (elapsed >= PED_FLASH_TIME_MS) {
       ped_set(pedActiveForLane, 1, 0); /* Back to DON'T WALK */
-      set_yellow(activeLane);
-      enter_state(STATE_YELLOW);
+      next_lane();
+      enter_state(STATE_GREEN);
     }
     break;
 
@@ -768,16 +886,30 @@ static void traffic_fsm_update(void) {
 
   case STATE_ALL_RED:
     if (elapsed >= ALL_RED_GAP_MS) {
-      next_lane();
-      enter_state(STATE_GREEN);
+      if (pedPendingAfterYellow) {
+        pedPendingAfterYellow = 0;
+        enter_state(STATE_PED_WALK);
+      } else {
+        next_lane();
+        enter_state(STATE_GREEN);
+      }
     }
     break;
 
   case STATE_EMERGENCY_CLEAR:
-    /* Yellow for 2 seconds, then switch to emergency lane */
-    if (elapsed >= EMERGENCY_CLEAR_MS) {
-      all_red();
-      delay_ms(500); /* Brief all-red gap */
+    if (stateFirstRun) {
+      stateFirstRun = 0;
+      set_yellow(activeLane);
+      uart2_puts("[EMG] Clearing for emergency...\r\n");
+    }
+    if (elapsed >= EMERGENCY_CLEAR_MS &&
+        elapsed < EMERGENCY_CLEAR_MS + EMERGENCY_RED_GAP_MS) {
+      if (!emergencyRedGapDone) {
+        emergencyRedGapDone = 1;
+        all_red(); /* Execute exactly once on entering the red gap */
+      }
+    } else if (elapsed >= EMERGENCY_CLEAR_MS + EMERGENCY_RED_GAP_MS) {
+      emergencyRedGapDone = 0;
       activeLane = emergencyLane;
       set_green(emergencyLane);
       enter_state(STATE_EMERGENCY_GREEN);
@@ -791,8 +923,15 @@ static void traffic_fsm_update(void) {
     if (elapsed >= EMERGENCY_GREEN_MS) {
       emergencyActive = 0;
       uart2_puts("[EMG] Emergency override ended.\r\n");
-      /* Resume normal cycle from next lane */
+      /* Proper clearance: emergency lane gets YELLOW → ALL_RED before
+         cross-traffic resumes. Set activeLane to emergency lane so
+         set_yellow/all_red act on it, then ALL_RED will restore
+         the saved lane via next_lane() logic. */
+      /* activeLane is already emergencyLane from EMERGENCY_CLEAR entry */
       set_yellow(activeLane);
+      /* Pre-set activeLane so after YELLOW→ALL_RED, STATE_GREEN
+         resumes on the saved lane (not next after emergency lane) */
+      activeLane = savedLaneBeforeEmergency;
       enter_state(STATE_YELLOW);
     }
     break;
@@ -824,9 +963,9 @@ static void lcd_update(void) {
     uint32_t remMs = (elapsed < totalMs) ? totalMs - elapsed : 0;
     uint32_t remSec = (remMs + 999) / 1000;
 
-    /* Row 0: "!! EMERGENCY !!" */
+    /* Row 0: "!! EMERGENCY !!" (15 chars, padded to 16 by lcd_print_padded) */
     memcpy(row0, "!! EMERGENCY !!", 16);
-    row0[15] = '\0';
+    row0[16] = '\0';
 
     /* Row 1: "DIR:NORTH  14s" */
     int len = 0;
@@ -856,14 +995,8 @@ static void lcd_update(void) {
     uint32_t totalMs = PED_WALK_TIME_MS + PED_FLASH_TIME_MS;
     uint32_t pedElapsed = elapsed;
     if (currentState == STATE_PED_FLASH)
-      pedElapsed += PED_WALK_TIME_MS; /* approximate */
-    uint32_t remMs =
-        (elapsed < (currentState == STATE_PED_WALK ? PED_WALK_TIME_MS
-                                                   : PED_FLASH_TIME_MS))
-            ? (currentState == STATE_PED_WALK ? PED_WALK_TIME_MS
-                                              : PED_FLASH_TIME_MS) -
-                  elapsed
-            : 0;
+      pedElapsed += PED_WALK_TIME_MS;
+    uint32_t remMs = (pedElapsed < totalMs) ? totalMs - pedElapsed : 0;
     uint32_t remSec = (remMs + 999) / 1000;
 
     memcpy(row0, "PED CROSSING    ", 16);
@@ -895,7 +1028,8 @@ static void lcd_update(void) {
     uint32_t dur = 0;
     switch (currentState) {
     case STATE_GREEN:
-      dur = GREEN_TIME_MS;
+      dur = ir_read(activeLane) ? GREEN_TIME_MS + IR_EXTEND_MAX_MS
+                                : GREEN_TIME_MS;
       break;
     case STATE_YELLOW:
       dur = YELLOW_TIME_MS;
@@ -971,6 +1105,11 @@ static void lcd_update(void) {
 int main(void) {
   SystemClock_Config();
   GPIO_Init();
+
+  /* Initialize button prev-state from hardware to avoid false edge on boot */
+  for (int i = 0; i < NUM_LANES; i++)
+    btnPrevState[i] = gpio_read(PL[i].btnPort, PL[i].btnPin);
+
   USART2_Init();
   USART3_Init();
 
@@ -1003,7 +1142,7 @@ int main(void) {
   delay_ms(1500);
 
   /* Blink user LED to show alive */
-  gpio_write(GPIOC, 13, 0); /* ON (inverted) */
+  gpio_write(GPIOA, 5, 1); /* ON (active-high on Nucleo LD2) */
 
   /* Main loop */
   while (1) {
@@ -1011,11 +1150,11 @@ int main(void) {
     traffic_fsm_update();
     lcd_update();
 
-    /* Heartbeat: toggle PC13 every 500ms */
+    /* Heartbeat: toggle PA5 (LD2) every 500ms */
     if ((millis() / 500) % 2)
-      gpio_write(GPIOC, 13, 0); /* ON */
+      gpio_write(GPIOA, 5, 1); /* ON */
     else
-      gpio_write(GPIOC, 13, 1); /* OFF */
+      gpio_write(GPIOA, 5, 0); /* OFF */
   }
 
   return 0; /* Never reached */
@@ -1036,28 +1175,110 @@ int main(void) {
  *     from the CubeIDE-generated main() function
  *   - Skip Section 14 (CubeIDE provides its own startup)
  *
+ * WARNING: This minimal vector table does NOT include a startup routine
+ * that copies .data from Flash to RAM or zeroes .bss. When using
+ * standalone compilation, your linker script + startup must handle this,
+ * or all initialized globals (stateFirstRun, btnPrevState, etc.) may be
+ * wrong on cold boot. CubeIDE provides this automatically.
+ *
  * Minimum vector table for standalone compilation:
  */
 
+/* CubeIDE defines USE_HAL_DRIVER and provides its own startup file
+   (startup_stm32f103rbtx.s) with Default_Handler, Reset_Handler, and
+   the full vector table. Skip this section when building inside CubeIDE
+   to avoid linker "multiple definition" errors. */
+#ifndef USE_HAL_DRIVER
+
 extern uint32_t _estack; /* Defined in linker script */
+extern uint32_t _sidata; /* Start of .data init values in Flash */
+extern uint32_t _sdata;  /* Start of .data section in RAM */
+extern uint32_t _edata;  /* End of .data section in RAM */
+extern uint32_t _sbss;   /* Start of .bss section in RAM */
+extern uint32_t _ebss;   /* End of .bss section in RAM */
+
+/* Default fault handler — fail-safe: set all lights RED, signal fault */
+void Default_Handler(void) {
+  /* Force all lanes RED via direct register writes (safe even if RAM is
+   * corrupt) */
+  /* North: PA0=RED ON */
+  GPIOA->BSRR = (1UL << 0);
+  /* East: PA9=RED ON */
+  GPIOA->BSRR = (1UL << 9);
+  /* South: PB13=RED ON */
+  GPIOB->BSRR = (1UL << 13);
+  /* West: PC8=RED ON */
+  GPIOC->BSRR = (1UL << 8);
+  /* Fast-blink PA5 (LD2) to indicate fault */
+  while (1) {
+    GPIOA->ODR ^= (1UL << 5);
+    for (volatile uint32_t i = 0; i < 200000; i++)
+      ;
+  }
+}
+
+/* Proper Reset Handler: initializes .data and .bss before calling main().
+   Without this, initialized globals (stateFirstRun=1, btnPrevState={1,1,1,1})
+   contain unpredictable RAM garbage on cold boot. The standard CRT startup
+   (crt0) normally does this, but our minimal vector table bypasses it. */
+void Reset_Handler(void) {
+  /* Copy .data section from Flash to RAM */
+  uint32_t *src = &_sidata;
+  uint32_t *dst = &_sdata;
+  while (dst < &_edata) {
+    *dst++ = *src++;
+  }
+
+  /* Zero .bss section */
+  dst = &_sbss;
+  while (dst < &_ebss) {
+    *dst++ = 0;
+  }
+
+  /* Call main */
+  main();
+
+  /* If main() ever returns, enter fault handler */
+  Default_Handler();
+}
 
 __attribute__((section(".isr_vector"))) void (*const vectors[])(void) = {
     (void (*)(void))&_estack, /* Initial stack pointer */
-    (void (*)(void))main,     /* Reset handler (simplified) */
+    Reset_Handler,            /* Reset handler (proper CRT init) */
+    Default_Handler,          /* NMI */
+    Default_Handler,          /* HardFault */
+    Default_Handler,          /* MemManage */
+    Default_Handler,          /* BusFault */
+    Default_Handler,          /* UsageFault */
     0,
     0,
     0,
+    0, /* Reserved */
+    0, /* SVCall */
     0,
-    0,
-    0,
-    0,
-    0, /* NMI, HardFault, etc. (stubs) */
-    0,
-    0,
-    0,
-    0,
-    0,
+    0,                                 /* Reserved */
+    0,                                 /* PendSV */
     (void (*)(void))SysTick_Handler,   /* SysTick (position 15) */
-    [16 ... 38] = 0,                   /* IRQ 0-22 */
-    (void (*)(void))USART3_IRQHandler, /* IRQ 39 = USART3 */
+    [16 ... 54] = Default_Handler,     /* All unused IRQs → safe trap */
+    (void (*)(void))USART3_IRQHandler, /* Index 55 = IRQ39 = USART3 */
 };
+
+#else /* USE_HAL_DRIVER defined (CubeIDE build) */
+
+/* Override CubeIDE's default HardFault handler with our safety handler.
+   CubeIDE's startup defines these as __weak, so our strong version wins. */
+void HardFault_Handler(void) {
+  /* Force all lanes RED */
+  GPIOA->BSRR = (1UL << 0);  /* North RED */
+  GPIOA->BSRR = (1UL << 9);  /* East RED */
+  GPIOB->BSRR = (1UL << 13); /* South RED */
+  GPIOC->BSRR = (1UL << 8);  /* West RED */
+  /* Fast-blink PA5 (LD2) to indicate fault */
+  while (1) {
+    GPIOA->ODR ^= (1UL << 5);
+    for (volatile uint32_t i = 0; i < 200000; i++)
+      ;
+  }
+}
+
+#endif /* USE_HAL_DRIVER */

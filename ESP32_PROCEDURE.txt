@@ -9,10 +9,12 @@ Your laptop microphone listens for ambulance sirens using a trained AI model.
 When a siren is detected, your laptop tells the ESP32-CAM (over WiFi) to take
 a photo. The ESP32 sends that photo to Roboflow to check if it's really an
 ambulance. If yes, the ESP32-CAM sends an ESP-NOW message to a second ESP32
-(receiver), which forwards it via UART wire to the STM32 traffic controller.
+(receiver), which ACKs the message back and forwards it via UART wire to the
+STM32 traffic controller. The detection pipeline runs on a FreeRTOS background
+task, so the ESP32-CAM's HTTP server stays responsive throughout.
 
 ```
-Laptop Mic → AI Model → WiFi → ESP32-CAM → Camera → Roboflow → ESP-NOW → Receiver ESP32 → UART → STM32
+Laptop Mic → AI Model → WiFi → ESP32-CAM → Camera → Roboflow → ESP-NOW → ACK ← Receiver ESP32 → UART → STM32
 ```
 
 ---
@@ -30,7 +32,7 @@ Hardware:
 
 Software:
   - Python 3.10 / 3.11 / 3.12 on laptop
-  - Arduino IDE (with ESP32 board package installed)
+  - Arduino IDE (with ESP32 board package v3.x+ installed — required for callback API)
   - Roboflow account with trained ambulance detection model
 
 Both laptop and ESP32-CAM must be on the SAME WiFi network (Vivo_V29_5G).
@@ -105,6 +107,10 @@ Open Arduino IDE → Sketch → Include Library → Manage Libraries:
 
 Note: No LoRa library needed! ESP-NOW is built into the ESP32.
 
+IMPORTANT: You need ESP32 Board Package v3.x+ (Espressif). The ESP-NOW
+callback API changed in v3.x — older v2.x code will not compile.
+Update via: Tools → Board Manager → search "esp32" → Update.
+
 ---
 
 ## STEP 5: FLASH THE RECEIVER ESP32 (DO THIS FIRST!)
@@ -154,7 +160,7 @@ automatically discover the receiver — no MAC copying needed!
    #define WIFI_PASSWORD       "123456789"            ← pre-configured
    #define ROBOFLOW_API_URL    "https://detect.roboflow.com/YOUR_PROJECT/VERSION"
    #define ROBOFLOW_API_KEY    "YOUR_API_KEY"
-   #define ROBOFLOW_TARGET_CLASS "ambulance"          ← class name from Roboflow
+   #define ROBOFLOW_TARGET_CLASS "Ambulance"          ← class name from Roboflow
    #define MONITORED_LANE_ID   0                      ← lane (0=N, 1=E, 2=S, 3=W)
 
    Sender MAC:   A8:42:E3:56:83:2C
@@ -269,11 +275,11 @@ The system is now running! It continuously:
    [HTTP] *** TRIGGER from laptop ML! ***
    [1/3] Capturing camera frame...
    [2/3] Sending to Roboflow API...
-   [Roboflow] Detection: class="ambulance" conf=0.87
-   [Roboflow] ✅ ambulance CONFIRMED!
+   [Roboflow] Detection: class="Ambulance" conf=0.87
+   [Roboflow] ✅ Ambulance CONFIRMED!
    [3/3] AMBULANCE CONFIRMED! Sending ESP-NOW alert...
    [ESP-NOW] TX: AMB:0
-   [ESP-NOW] Send OK to AA:BB:CC:DD:EE:FF
+   [ESP-NOW] Alert confirmed by Receiver on attempt 1/3
 
 5. On Receiver ESP32 Serial Monitor you should see:
 
@@ -282,6 +288,7 @@ The system is now running! It continuously:
    ║  AMBULANCE ALERT! Lane 0 (NORTH)
    ╚══════════════════════════════════════╝
    [UART] Forwarded to STM32: "AMB:0"
+   [ESP-NOW] TX: Sent ACK to camera -> "ACK:AMB"
 
 ---
 
@@ -345,6 +352,17 @@ Fix:    - Run: sudo usermod -aG dialout $USER
 Problem: ESP32-CAM says "[WiFi] FAILED"
 Fix:    - ESP32 only works with 2.4 GHz WiFi (not 5 GHz)
         - Check SSID (Vivo_V29_5G) and password (123456789) — they are case sensitive
+
+Problem: ESP-NOW ACK timeout ("All retries exhausted! Receiver did not ACK.")
+Fix:    - Sender retries 3× with 500ms wait per attempt
+        - Check receiver is powered on and paired (serial shows "PAIRED")
+        - Ensure both ESP32s on same WiFi network/channel
+        - Try moving boards closer together
+
+Problem: Compile errors related to ESP-NOW callback
+Fix:    - You need ESP32 Board Package v3.x+ (Espressif)
+        - Update via: Arduino IDE → Tools → Board Manager → search "esp32" → Update
+        - The callback API changed from v2.x to v3.x
 
 ---
 

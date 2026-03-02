@@ -34,7 +34,9 @@
  * ============================================================================
  */
 
-#include "base64.h"
+/* NOTE: base64.h removed — Roboflow accepts raw binary JPEG via POST.
+   Base64 encoding allocated 40-60KB in internal RAM, causing heap
+   fragmentation crashes on the ESP32-CAM's limited internal SRAM. */
 #include "esp_camera.h"
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
@@ -137,7 +139,7 @@ static const uint8_t HARDCODED_RECEIVER_MAC[] = {0xFC, 0xE8, 0xC0,
 #define PCLK_GPIO_NUM 22
 
 /* ╔═══════════════════════════════════════════════════════════════════╗
- * ║  SECTION 4: GLOBAL STATE                                        ║
+ * ║  SECTION 4: GLOBAL STATE & FREERTOS                             ║
  * ╚═══════════════════════════════════════════════════════════════════╝ */
 
 static const char *LANE_NAMES[] = {"NORTH", "EAST", "SOUTH", "WEST"};
@@ -154,6 +156,9 @@ static uint8_t pendingPairMAC[6] = {0};
 
 /* ESP-NOW send status */
 static volatile bool espNowSendSuccess = false;
+
+/* Application-layer ACK from receiver */
+static volatile bool receiverAcked = false;
 
 /* Sound detection */
 static int soundHighCount = 0;
@@ -181,6 +186,15 @@ static TrafficSimPhase_t tsimPhase = TSIM_GREEN;
 static uint8_t tsimActiveLane = 0;
 static uint32_t tsimPhaseStartMs = 0;
 static uint8_t tsimAmbulanceLane = 0;
+
+/* FreeRTOS: async detection pipeline */
+typedef struct {
+  char source[16];
+} TriggerMsg_t;
+
+QueueHandle_t pipelineQueue = NULL;
+TaskHandle_t pipelineTaskHandle = NULL;
+
 /* HTTP trigger server */
 #if TRIGGER_MODE == 0 || TRIGGER_MODE == 2
 WebServer httpServer(HTTP_TRIGGER_PORT);
@@ -390,7 +404,7 @@ void onEspNowSend(const esp_now_send_info_t *info,
 
 /* ESP-NOW receive callback — listens for pairing beacons from receiver (Updated
  * for v3.x API) */
-void onEspNowReceive(const esp_now_recv_info *info, const uint8_t *data,
+void onEspNowReceive(const esp_now_recv_info_t *info, const uint8_t *data,
                      int len) {
   const uint8_t *mac_addr = info->src_addr;
   if (len <= 0 || len >= 32)
@@ -406,6 +420,11 @@ void onEspNowReceive(const esp_now_recv_info *info, const uint8_t *data,
     pairBeaconReceived = true;
     DBG("[PAIR] Beacon from %02X:%02X:%02X:%02X:%02X:%02X\n", mac_addr[0],
         mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+  }
+
+  /* Listen for application-layer ACK from receiver */
+  if (receiverPaired && strcmp(msg, "ACK:AMB") == 0) {
+    receiverAcked = true;
   }
 }
 
@@ -423,6 +442,7 @@ bool initEspNow(void) {
   memset(bcastPeer.peer_addr, 0xFF, 6);
   bcastPeer.channel = 0;
   bcastPeer.encrypt = false;
+  bcastPeer.ifidx = WIFI_IF_STA;
   esp_now_add_peer(&bcastPeer);
 
   DBGLN("[ESP-NOW] Initialized. Listening for receiver beacon...");
@@ -450,6 +470,7 @@ bool autoDiscoverReceiver(void) {
       memcpy(peerInfo.peer_addr, receiverMAC, 6);
       peerInfo.channel = 0;
       peerInfo.encrypt = false;
+      peerInfo.ifidx = WIFI_IF_STA;
 
       if (esp_now_add_peer(&peerInfo) != ESP_OK) {
         DBGLN("[PAIR] Failed to add receiver peer!");
@@ -480,6 +501,7 @@ bool autoDiscoverReceiver(void) {
   memcpy(peerInfo.peer_addr, receiverMAC, 6);
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
 
   if (esp_now_add_peer(&peerInfo) == ESP_OK) {
     receiverPaired = true;
@@ -504,25 +526,29 @@ bool sendAmbulanceAlert(uint8_t laneId) {
   DBG("[ESP-NOW] TX: %s\n", msg);
 
   for (int r = 0; r < ESPNOW_RETRY_COUNT; r++) {
-    espNowSendSuccess = false;
+    receiverAcked = false;
     esp_err_t result = esp_now_send(receiverMAC, (uint8_t *)msg, strlen(msg));
 
     if (result == ESP_OK) {
-      delay(50); /* Brief wait for callback */
-      if (espNowSendSuccess) {
-        DBG("[ESP-NOW] Alert sent on attempt %d/%d\n", r + 1,
-            ESPNOW_RETRY_COUNT);
-        return true;
+      /* Wait up to 500ms for application-layer ACK:AMB from receiver */
+      uint32_t waitStart = millis();
+      while ((millis() - waitStart) < 500) {
+        if (receiverAcked) {
+          DBG("[ESP-NOW] Alert confirmed by Receiver on attempt %d/%d\n", r + 1,
+              ESPNOW_RETRY_COUNT);
+          return true;
+        }
+        delay(10);
       }
     }
 
-    DBG("[ESP-NOW] Attempt %d/%d failed, retrying...\n", r + 1,
+    DBG("[ESP-NOW] Attempt %d/%d failed (No ACK), retrying...\n", r + 1,
         ESPNOW_RETRY_COUNT);
     if (r < ESPNOW_RETRY_COUNT - 1)
       delay(ESPNOW_RETRY_DELAY_MS);
   }
 
-  DBGLN("[ESP-NOW] All retries exhausted!");
+  DBGLN("[ESP-NOW] All retries exhausted! Receiver did not ACK.");
   return false;
 }
 
@@ -546,15 +572,15 @@ bool callRoboflowAPI(camera_fb_t *fb) {
   url += "&confidence=" + String(ROBOFLOW_CONF_MIN, 2);
   url += "&format=json";
 
-  DBG("[Roboflow] Encoding %u bytes to base64...\n", fb->len);
-  String imageBase64 = base64::encode(fb->buf, fb->len);
-  DBG("[Roboflow] Base64 size: %u chars\n", imageBase64.length());
+  /* Send raw binary JPEG directly from PSRAM — no Base64 allocation needed.
+     Roboflow accepts binary payloads via application/x-www-form-urlencoded. */
+  DBG("[Roboflow] Uploading %u bytes directly to API...\n", fb->len);
 
   HTTPClient http;
   http.begin(url);
   http.setTimeout(ROBOFLOW_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  int httpCode = http.POST(imageBase64);
+  int httpCode = http.POST(fb->buf, fb->len);
 
   if (httpCode != 200) {
     DBG("[Roboflow] API Error! HTTP %d\n", httpCode);
@@ -774,6 +800,19 @@ void setup() {
   /* Traffic simulation */
   TrafficSim_Init();
 
+  /* FreeRTOS: async detection pipeline (runs on Core 1) */
+  pipelineQueue = xQueueCreate(5, sizeof(TriggerMsg_t));
+  xTaskCreatePinnedToCore(
+      [](void *) {
+        TriggerMsg_t msg;
+        while (1) {
+          if (xQueueReceive(pipelineQueue, &msg, portMAX_DELAY) == pdTRUE) {
+            runDetectionPipeline(msg.source);
+          }
+        }
+      },
+      "DetectTask", 8192, NULL, 1, &pipelineTaskHandle, 1);
+
   /* Status report */
   DBGLN("\n-------- SYSTEM STATUS --------");
   DBG("  WiFi:     %s\n", wifiConnected ? "OK" : "FAIL");
@@ -796,7 +835,7 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  /* Handle HTTP requests */
+  /* Handle HTTP requests (always responsive — pipeline runs in background) */
 #if TRIGGER_MODE == 0 || TRIGGER_MODE == 2
   if (wifiConnected)
     httpServer.handleClient();
@@ -816,12 +855,22 @@ void loop() {
     }
   }
 
+  /* Helper: queue a trigger asynchronously + assert cooldown immediately */
+  auto triggerAsync = [&](const char *source) {
+    TriggerMsg_t msg;
+    strncpy(msg.source, source, sizeof(msg.source) - 1);
+    msg.source[sizeof(msg.source) - 1] = '\0';
+    xQueueSend(pipelineQueue, &msg, 0);
+    inCooldown = true;
+    lastAlertTime = millis();
+  };
+
   /* Priority 1: WiFi HTTP trigger */
 #if TRIGGER_MODE == 0 || TRIGGER_MODE == 2
   if (httpTriggerPending) {
     httpTriggerPending = false;
     if (cameraInitialized && wifiConnected) {
-      runDetectionPipeline("ml_wifi");
+      triggerAsync("ml_wifi");
     } else if (espNowInitialized) {
       DBGLN("[Fallback] Camera/WiFi down -> direct ESP-NOW alert.");
       sendAmbulanceAlert(MONITORED_LANE_ID);
@@ -837,7 +886,7 @@ void loop() {
 #if TRIGGER_MODE == 1 || TRIGGER_MODE == 2
   if (checkUARTTrigger()) {
     if (cameraInitialized && wifiConnected) {
-      runDetectionPipeline("ml_uart");
+      triggerAsync("ml_uart");
     } else if (espNowInitialized) {
       DBGLN("[Fallback] Camera/WiFi down -> direct ESP-NOW alert.");
       sendAmbulanceAlert(MONITORED_LANE_ID);
@@ -853,7 +902,7 @@ void loop() {
   if (detectSiren()) {
     DBGLN("[Main] Sound sensor triggered (fallback).");
     if (cameraInitialized && wifiConnected) {
-      runDetectionPipeline("sound");
+      triggerAsync("sound");
     } else if (espNowInitialized) {
       DBGLN("[Fallback] Camera/WiFi down -> direct ESP-NOW alert.");
       sendAmbulanceAlert(MONITORED_LANE_ID);

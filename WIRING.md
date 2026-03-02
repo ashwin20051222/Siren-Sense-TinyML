@@ -237,7 +237,9 @@ The ESP32 DevKit is powered via its USB port. No special power supply needed.
 
 # 📡 PART 4: ESP-NOW WiFi Link (ESP32-CAM ↔ ESP32 Receiver)
 
-The two ESP32 boards communicate wirelessly using **ESP-NOW** (built-in WiFi protocol), with **automatic pairing** via beacon broadcast + hardcoded MAC fallback. Use `esp32_firmware/find_mac_address/find_mac_address.ino` to discover your board's MAC.
+The two ESP32 boards communicate wirelessly using **ESP-NOW** (built-in WiFi protocol), with **automatic pairing** via beacon broadcast + hardcoded MAC fallback. The receiver sends an **application-layer ACK** (`ACK:AMB`) back to the sender for every ambulance alert, and the sender retries up to 3× if no ACK arrives within 500ms. Use `esp32_firmware/find_mac_address/find_mac_address.ino` to discover your board's MAC.
+
+> **Note:** Requires **ESP32 Board Package v3.x+** (Espressif). The ESP-NOW callback API changed in v3.x.
 
 ### Current MAC Addresses
 
@@ -283,9 +285,12 @@ The two ESP32 boards communicate wirelessly using **ESP-NOW** (built-in WiFi pro
 
 ```
 ESP32-CAM sends:   "AMB:<lane>"     (e.g. "AMB:0" for North lane)
+Receiver replies:  "ACK:AMB"        (application-layer acknowledgment)
 Receiver parses:   lane_id = 0
 Receiver forwards: "AMB:0\n" via UART to STM32
 STM32 action:      Makes North lane green for 15s, all others red
+
+If no ACK within 500ms, sender retries (up to 3 attempts).
 ```
 
 > [!IMPORTANT]
@@ -411,6 +416,7 @@ After wiring, verify each subsystem:
 - [ ] **Receiver ESP32 boots** — Serial shows WiFi ✅, ESP-NOW ✅, broadcasting beacon
 - [ ] **Auto-pairing** — Sender discovers receiver automatically, both show "PAIRED" in Serial
 - [ ] **ESP-NOW link** — Trigger pipeline on ESP32-CAM → receiver Serial shows `AMB:0` received
+- [ ] **ACK confirmation** — Sender Serial shows `Alert confirmed by Receiver on attempt 1/3`
 - [ ] **UART bridge** — Receiver's `AMB:0` message appears on STM32 serial
 - [ ] **End-to-end** — Play siren → laptop detects → ESP32 camera → Roboflow → ESP-NOW → receiver → STM32 → ambulance lane goes green
 

@@ -127,7 +127,9 @@ This section sets up the full pipeline: **Laptop ML → ESP32-CAM → Roboflow �
 | FTDI USB-UART adapter | For flashing ESP32-CAM firmware |
 | USB microphone (laptop) | Primary audio input for ML |
 
-> **No LoRa modules needed!** ESP-NOW uses the built-in WiFi hardware. Both ESP32s **auto-pair** via beacon, with hardcoded MAC fallback.
+> **No LoRa modules needed!** ESP-NOW uses the built-in WiFi hardware. Both ESP32s **auto-pair** via beacon, with hardcoded MAC fallback. The receiver **ACKs** every alert (`ACK:AMB`), and the sender retries up to 3× on failure.
+>
+> **Requires ESP32 Board Package v3.x+** (Espressif). The ESP-NOW callback API changed in v3.x — older v2.x code will not compile. Update via Arduino IDE: Tools → Board Manager → search "esp32".
 
 ### 5.2a Find Your Board's MAC Address (Optional)
 
@@ -207,7 +209,7 @@ See [WIRING.md](WIRING.md) for complete wiring diagrams and pin maps.
    #define WIFI_PASSWORD       "123456789"
    #define ROBOFLOW_API_URL    "https://detect.roboflow.com/YOUR_PROJECT/VERSION"
    #define ROBOFLOW_API_KEY    "YOUR_API_KEY"
-   #define ROBOFLOW_TARGET_CLASS "ambulance"
+   #define ROBOFLOW_TARGET_CLASS "Ambulance"
    #define MONITORED_LANE_ID   0
    // Sender MAC:   A8:42:E3:56:83:2C
    // Receiver MAC: FC:E8:C0:7A:B7:A0 (hardcoded fallback)
@@ -244,13 +246,16 @@ python3 src/siren_to_esp32.py --check-esp32 --esp32-ip 192.168.1.50
 1. Laptop mic captures 3-second audio windows at 16 kHz
 2. TFLite model classifies: `emergency` vs `non_emergency`
 3. If siren detected (≥ threshold, consecutive hits) → HTTP GET to ESP32-CAM
-4. ESP32-CAM captures JPEG frame with OV2640 camera
-5. Image base64-encoded and POSTed to Roboflow inference API
-6. If `"ambulance"` detected with ≥ 60% confidence:
+4. Trigger queued to **FreeRTOS background task** (main loop stays responsive for HTTP server)
+5. ESP32-CAM captures JPEG frame with OV2640 camera
+6. Raw JPEG binary POSTed to Roboflow inference API (no Base64 — saves ~50KB RAM)
+7. If `"Ambulance"` detected with ≥ 60% confidence:
    - ESP-NOW sends `"AMB:<lane_id>"` to receiver ESP32
+   - Receiver sends `"ACK:AMB"` back to sender (application-layer ACK)
+   - Sender retries up to 3× if no ACK within 500ms
    - Receiver forwards `"AMB:<lane_id>"` via UART to STM32
    - STM32 traffic controller gives priority to that lane
-7. 60-second cooldown before next detection
+8. 60-second cooldown before next detection (applied immediately on trigger)
 
 ### 5.7 STM32 Traffic Controller
 
@@ -310,6 +315,8 @@ The STM32 firmware is in `stm32_firmware/stm32_traffic_controller.c`. It's a bar
 | No audio input | Run `--list-devices`, check mic is connected |
 | Serial port permission | `sudo usermod -aG dialout $USER`, then re-login |
 | Need to find MAC address | Flash `esp32_firmware/find_mac_address/find_mac_address.ino` to the board |
+| ESP-NOW ACK timeout | Sender retries 3× with 500ms wait. If all fail, check receiver is running, paired, and on same WiFi channel |
+| Compile error on ESP32 | Requires **ESP32 Board Package v3.x+** (Espressif). Update via Arduino Board Manager |
 | TensorFlow import error | Use Python 3.10–3.12, not 3.13+ |
 
 ---

@@ -2,7 +2,7 @@
 
 > **Detailed setup & training instructions →** [INSTRUCTIONS.md](INSTRUCTIONS.md) | **Wiring →** [WIRING.md](WIRING.md)
 
-A two-stage emergency vehicle detection system combining **ML audio detection** (laptop) with **visual verification** (ESP32-CAM + Roboflow) and **ESP-NOW WiFi alerting** (receiver ESP32 → STM32 traffic controller). Both ESP32s are paired via **MAC address** (Sender: `A8:42:E3:56:83:2C`, Receiver: `FC:E8:C0:7A:B7:A0`). The 16×2 LCD display is connected to the **STM32F103RB** only.
+A two-stage emergency vehicle detection system combining **ML audio detection** (laptop) with **visual verification** (ESP32-CAM + Roboflow) and **ESP-NOW WiFi alerting** (receiver ESP32 → STM32 traffic controller). The sender runs the **detection pipeline on a FreeRTOS background task** (non-blocking), and the receiver **ACKs every alert** (`ACK:AMB`) with the sender retrying up to 3× on failure. Both ESP32s are paired via **MAC address** (Sender v5.0: `A8:42:E3:56:83:2C`, Receiver v7.0: `FC:E8:C0:7A:B7:A0`). The 16×2 LCD display is connected to the **STM32F103RB** only. Requires **ESP32 Board Package v3.x+** (callback API).
 
 ---
 
@@ -79,9 +79,9 @@ python3 src/inference_pi.py --threshold 0.8
 | ESP32-CAM (Sender) | `A8:42:E3:56:83:2C` |
 | ESP32 DevKit (Receiver) | `FC:E8:C0:7A:B7:A0` |
 
-**b) Flash Receiver ESP32** — WiFi credentials are pre-configured (`Vivo_V29_5G`), flash `stm32_esp32_receiver.ino` with Arduino IDE (Board: ESP32 Dev Module).
+**b) Flash Receiver ESP32** — WiFi credentials are pre-configured (`Vivo_V29_5G`), flash `stm32_esp32_receiver.ino` with Arduino IDE (Board: ESP32 Dev Module, **ESP32 Board Package v3.x+**).
 
-**c) Flash ESP32-CAM** — WiFi/Roboflow credentials pre-configured, flash `esp32_cam_sender.ino` (Board: AI Thinker ESP32-CAM). Note the IP address.
+**c) Flash ESP32-CAM** — WiFi/Roboflow credentials pre-configured, flash `esp32_cam_sender.ino` (Board: AI Thinker ESP32-CAM, **ESP32 Board Package v3.x+**). Note the IP address.
 
 **c) Wire Receiver ESP32 → STM32** — Connect ESP32 GPIO 17 (TX2) → STM32 PB11 (USART3 RX) + common GND.
 
@@ -91,7 +91,7 @@ python3 src/inference_pi.py --threshold 0.8
 python3 src/siren_to_esp32.py --mode wifi --esp32-ip 192.168.1.50 --threshold 0.80
 ```
 
-When the ML detects a siren → triggers ESP32-CAM → camera captures image → Roboflow verifies ambulance → ESP-NOW alerts receiver → UART → STM32.
+When the ML detects a siren → triggers ESP32-CAM → camera captures image (async FreeRTOS task) → Roboflow verifies ambulance → ESP-NOW alerts receiver → receiver ACKs → UART → STM32.
 
 ---
 
@@ -120,11 +120,13 @@ When the ML detects a siren → triggers ESP32-CAM → camera captures image →
 #define WIFI_PASSWORD       "123456789"
 #define ROBOFLOW_API_URL    "https://detect.roboflow.com/YOUR_PROJECT/YOUR_VERSION"
 #define ROBOFLOW_API_KEY    "YOUR_ROBOFLOW_API_KEY"
-#define ROBOFLOW_TARGET_CLASS "ambulance"
+#define ROBOFLOW_TARGET_CLASS "Ambulance"
 #define MONITORED_LANE_ID   0           // 0=North, 1=East, 2=South, 3=West
 // Sender MAC:   A8:42:E3:56:83:2C
 // Receiver MAC: FC:E8:C0:7A:B7:A0 (hardcoded fallback + auto-pair)
 ```
+
+> **Note:** Requires **ESP32 Board Package v3.x+** (Espressif). The ESP-NOW callback API changed in v3.x — older v2.x code will not compile.
 
 ### Receiver ESP32 (`stm32_esp32_receiver.ino` Section 1)
 
@@ -162,13 +164,16 @@ Flash this utility to any ESP32 to discover its MAC address:
 3. TFLite CNN classifies: emergency vs non_emergency
 4. If emergency detected (≥80% confidence, 2 consecutive):
    └─► HTTP GET http://<ESP32_CAM_IP>/trigger
-5. ESP32-CAM captures JPEG frame (640×480)
-6. Base64-encoded image POSTed to Roboflow API
-7. If "ambulance" class detected (≥60% confidence):
+5. Trigger queued to FreeRTOS background task (main loop stays responsive)
+6. ESP32-CAM captures JPEG frame (640×480)
+7. Raw JPEG binary POSTed to Roboflow API (no Base64 — saves ~50KB RAM)
+8. If "Ambulance" class detected (≥60% confidence):
    └─► ESP-NOW sends "AMB:<lane_id>" to receiver ESP32 (auto-paired)
-8. Receiver forwards "AMB:<lane_id>" via UART to STM32
-9. STM32 traffic controller gives priority to that lane
-10. 60-second cooldown before next detection
+9. Receiver sends "ACK:AMB" back to sender (application-layer ACK)
+   └─► Sender retries up to 3× if no ACK within 500ms
+10. Receiver forwards "AMB:<lane_id>" via UART to STM32
+11. STM32 traffic controller gives priority to that lane
+12. 60-second cooldown before next detection (applied immediately on trigger)
 ```
 
 ---
@@ -206,11 +211,13 @@ Flash this utility to any ESP32 to discover its MAC address:
 | ESP32-CAM not reachable via WiFi | Check SSID/password (`Vivo_V29_5G`), ensure laptop and ESP32 on same network |
 | Roboflow API returns error | Verify API key and project URL in sender `.ino` |
 | ESP-NOW send fails | Ensure both ESP32s on same WiFi network (`Vivo_V29_5G`). Check Serial Monitor for pairing status |
+| ESP-NOW ACK timeout | Sender retries 3× with 500ms wait per attempt. If all fail, check receiver is running and paired. Verify same WiFi channel |
 | Receiver not getting messages | Both must be powered on — receiver broadcasts beacon, sender discovers it automatically. If auto-pair fails, hardcoded MAC (FC:E8:C0:7A:B7:A0) is used as fallback |
 | Pairing timeout | Ensure both ESP32s are on and connected to same WiFi within 30 seconds of each other. Sender falls back to hardcoded receiver MAC after timeout |
 | Need to find MAC address | Flash `esp32_firmware/find_mac_address/find_mac_address.ino` to the board, open Serial Monitor at 115200 |
 | LCD blank / not working | LCD is on STM32 only (PC6/PC7). Try I2C address 0x3F, check wiring + 5V power |
 | Audio device not found | Run `--list-devices` to see available inputs |
+| Compile error on ESP32 | Requires **ESP32 Board Package v3.x+** (Espressif). The ESP-NOW callback API changed — update via Arduino Board Manager |
 | `/dev/ttyUSB0` permission denied | `sudo usermod -aG dialout $USER` then re-login |
 
 ---
